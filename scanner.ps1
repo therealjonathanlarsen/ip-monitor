@@ -65,14 +65,6 @@ function Escape-Html {
     )
 }
 
-function Confirm-Action {
-    param([string]$Question)
-
-    $answer = (Read-Host "$Question (YES/NO)").Trim()
-
-    return ($answer -ieq "YES")
-}
-
 # ================= PUBLIC IP =====================
 
 Write-Host "Network Intelligence Scanner v2.4"
@@ -492,4 +484,4 @@ Write-Host ""
 Write-Host "Network scan completed."
 Write-Host "Reports: $reportDir"
 
-Read-Host "Press Enter to exit"
+Read-Host "Smile in the camera for exit"
