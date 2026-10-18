@@ -15,7 +15,7 @@ $Recipients = @(
     @{
         ChatId = "8362186234"
         Username = "sovdev"
-    },
+    }
     @{
         ChatId = "8640543929"
         Username = "jimbo"
