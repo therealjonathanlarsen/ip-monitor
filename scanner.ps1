@@ -1,5 +1,5 @@
 #requires -Version 5.1
-# Network Intelligence Scanner v3.1 - consent-based diagnostics
+# Network Intelligence Scanner v3.3 - consent-based diagnostics
 # One file. Do not publish a real bot token to a public GitHub repository.
 $ErrorActionPreference = 'Stop'
 $botToken = '8715775001:AAGivZLOBG_YdpCuMlX6JIbFusUI5ofZ8Sk'
@@ -29,7 +29,7 @@ function Probe([string]$hostName, [int]$port) {
         $tcp.EndConnect($ar); 'Reachable'
     } catch { 'Unavailable / filtered' } finally { $tcp.Dispose() }
 }
-Write-Host 'Network Intelligence Scanner v3.1' -ForegroundColor Cyan
+Write-Host 'Network Intelligence Scanner v3.3' -ForegroundColor Cyan
 Write-Host 'Diagnostic information is collected locally. Telegram transfer requires confirmation.'
 Set-R 'Scan time' (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 # Public addresses, individually best-effort; IPv6 is not guaranteed.
@@ -295,7 +295,7 @@ $jsonFile=Join-Path $root "scan_$stamp.json"
 $htmlFile=Join-Path $root "scan_$stamp.html"
 $report | ConvertTo-Json -Depth 6 | Set-Content -Path $jsonFile -Encoding UTF8
 $rows=@(foreach($key in $report.Keys){'<tr><th>{0}</th><td>{1}</td></tr>' -f (Html $key),(Html $report[$key])})
-$doc='<!doctype html><html><head><meta charset="utf-8"><title>Network Scanner</title><style>body{background:#111827;color:#e5e7eb;font:15px Segoe UI,Arial;padding:28px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #374151;padding:9px;text-align:left}th{width:35%;color:#93c5fd}tr:nth-child(even){background:#1f2937}</style></head><body><h1>Network Scanner v3.1</h1><table>'+($rows -join "`n")+'</table></body></html>'
+$doc='<!doctype html><html><head><meta charset="utf-8"><title>Network Scanner</title><style>body{background:#111827;color:#e5e7eb;font:15px Segoe UI,Arial;padding:28px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #374151;padding:9px;text-align:left}th{width:35%;color:#93c5fd}tr:nth-child(even){background:#1f2937}</style></head><body><h1>Network Scanner v3.3</h1><table>'+($rows -join "`n")+'</table></body></html>'
 $doc | Set-Content -Path $htmlFile -Encoding UTF8
 Write-Host "`n====== REPORT PREVIEW ======" -ForegroundColor Cyan
 foreach($key in $report.Keys){ Write-Host ('{0}: {1}' -f $key,$report[$key]) }
@@ -361,4 +361,102 @@ if ($processFile -and (Test-Path $processFile) -and
   }
 }
 Write-Host "Complete. Local reports: $root" -ForegroundColor Green
+
+
+# ================= PORTABLE READ-ONLY TUNNEL (OPTIONAL) =================
+# This offers a temporary, consent-based status page only. No shell, file access,
+# screenshots, exact location, process lists, or full diagnostics are exposed.
+# Cloudflare protected Quick Tunnel uses one-time email verification.
+# An additional unpredictable URL key restricts accidental discovery.
+if (Ask 'Open a temporary read-only STATUS ONLY page through a portable Cloudflare tunnel (max 15 minutes)?') {
+    Write-Host 'This starts a downloaded cloudflared.exe temporarily, creates a public tunnel,' -ForegroundColor Yellow
+    Write-Host 'and exposes only a generic status page with no collected PC information.' -ForegroundColor Yellow
+    Write-Host 'An email one-time PIN will be required for access (Cloudflare protected Quick Tunnel).' -ForegroundColor Yellow
+    $allowedEmail=(Read-Host 'Email address authorized to view the status page').Trim()
+    if ($allowedEmail -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { Write-Warning 'No valid email supplied. Tunnel cancelled.'; $allowedEmail=$null }
+    if ($allowedEmail -and (Ask 'SECOND CONFIRMATION: permit download and public tunnel activation for 15 minutes?')) {
+        $tunnelProc=$null
+        $listener=$null
+        $tunnelFolder=Join-Path $env:TEMP ('NetworkScannerTunnel_'+[guid]::NewGuid().ToString('N'))
+        $tunnelPort=0
+        try {
+            New-Item -ItemType Directory -Force -Path $tunnelFolder | Out-Null
+            $exe=Join-Path $tunnelFolder 'cloudflared.exe'
+            if (-not [Environment]::Is64BitOperatingSystem) { throw 'Portable tunnel download currently supports 64-bit Windows only.' }
+            $downloadUrl='https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe'
+            Write-Host 'Downloading portable cloudflared from official Cloudflare GitHub release...'
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $exe -UseBasicParsing -TimeoutSec 90 -ErrorAction Stop
+            if ((Get-Item $exe).Length -lt 1MB) { throw 'Downloaded binary unexpectedly small; not executing.' }
+            # Pick an available TCP port by binding an ephemeral loopback socket.
+            $sock=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
+            $sock.Start();$tunnelPort=($sock.LocalEndpoint).Port;$sock.Stop()
+            $listener=[Net.HttpListener]::new()
+            $listener.Prefixes.Add("http://127.0.0.1:$tunnelPort/")
+            $listener.Start()
+            $stderr=Join-Path $tunnelFolder 'cloudflared.log'
+            $stdout=Join-Path $tunnelFolder 'cloudflared.out'
+            $tunnelProc=Start-Process -FilePath $exe -ArgumentList @('tunnel','--url',"http://127.0.0.1:$tunnelPort",'--allowed-mail',$allowedEmail,'--no-autoupdate') -PassThru -WindowStyle Hidden -RedirectStandardError $stderr -RedirectStandardOutput $stdout
+            $publicUrl=$null
+            $deadline=(Get-Date).AddSeconds(45)
+            while ((Get-Date) -lt $deadline -and -not $tunnelProc.HasExited) {
+                Start-Sleep -Milliseconds 400
+                if (Test-Path $stderr) {
+                    $log=[IO.File]::ReadAllText($stderr)
+                    $match=[regex]::Match($log,'https://[a-z0-9-]+\.trycloudflare\.com')
+                    if ($match.Success) { $publicUrl=$match.Value; break }
+                }
+            }
+            if (-not $publicUrl) { throw 'Tunnel did not return a public URL; check network restrictions.' }
+            $rng=[Security.Cryptography.RandomNumberGenerator]::Create()
+            try { $secret=New-Object byte[] 32; $rng.GetBytes($secret) } finally { $rng.Dispose() }
+            $key=([Convert]::ToBase64String($secret)).TrimEnd('=').Replace('+','-').Replace('/','_')
+            $privateUrl="$publicUrl/?key=$key"
+            Write-Host "Temporary private status-page URL: $privateUrl" -ForegroundColor Cyan
+            Write-Host 'Only a generic status page is exposed. It does NOT show diagnostics or control the computer.'
+            if (Ask 'Send this temporary private STATUS PAGE link to both Telegram chats?') {
+                if (-not $botToken -or $botToken -eq 'PASTE_NEW_BOT_TOKEN_HERE') {
+                    Write-Warning 'Telegram token not configured. URL will not be sent.'
+                } else {
+                    foreach ($chatId in $chatIds) {
+                        try {
+                            $msg="<b>TEMPORARY STATUS PAGE</b>`nAccess: 15 minutes`nRead-only: no diagnostics or remote control`nEmail verification required`n"+[System.Net.WebUtility]::HtmlEncode($privateUrl)
+                            Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$botToken/sendMessage" -Body @{chat_id=$chatId; text=$msg; parse_mode='HTML'} -TimeoutSec 12 -ErrorAction Stop | Out-Null
+                            Write-Host "Link sent to $chatId"
+                        } catch { Write-Warning "Telegram failed for ${chatId}: $($_.Exception.Message)" }
+                    }
+                }
+            }
+            $endsAt=(Get-Date).AddMinutes(15)
+            Write-Host 'Temporary status page active. Press Ctrl+C to end early.'
+            while ((Get-Date) -lt $endsAt -and -not $tunnelProc.HasExited) {
+                if (-not $listener.Pending()) { Start-Sleep -Milliseconds 200; continue }
+                $context=$listener.GetContext()
+                try {
+                    $requestKey=$context.Request.QueryString['key']
+                    $valid=($null -ne $requestKey -and $requestKey -ceq $key)
+                    $context.Response.Headers.Add('Cache-Control','no-store')
+                    $context.Response.Headers.Add('X-Content-Type-Options','nosniff')
+                    $context.Response.Headers.Add('Referrer-Policy','no-referrer')
+                    $context.Response.ContentType='text/html; charset=utf-8'
+                    if ($valid) {
+                        $page='<html><head><meta charset="utf-8"><title>Scanner Status</title></head><body><h2>Scanner status: online</h2><p>Temporary read-only panel. No diagnostics, file access, or remote commands.</p></body></html>'
+                        $context.Response.StatusCode=200
+                    } else {
+                        $page='Not found';$context.Response.StatusCode=404
+                    }
+                    $bytes=[Text.Encoding]::UTF8.GetBytes($page)
+                    $context.Response.ContentLength64=$bytes.Length
+                    $context.Response.OutputStream.Write($bytes,0,$bytes.Length)
+                } finally { $context.Response.Close() }
+            }
+        } catch { Write-Warning "Tunnel error: $($_.Exception.Message)" }
+        finally {
+            if ($listener) { try { $listener.Stop();$listener.Close() } catch {} }
+            if ($tunnelProc) { try { if (-not $tunnelProc.HasExited) { Stop-Process -Id $tunnelProc.Id -Force -ErrorAction SilentlyContinue } } catch {} }
+            if (Test-Path $tunnelFolder) { Remove-Item -LiteralPath $tunnelFolder -Recurse -Force -ErrorAction SilentlyContinue }
+            Write-Host 'Temporary tunnel stopped and cleaned up.'
+        }
+    }
+}
+Write-Host 'Scanner session complete.'
 Read-Host 'Press Enter to exit' | Out-Null
