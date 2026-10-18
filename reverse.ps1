@@ -5,69 +5,49 @@
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-# =========================================
-# SETTINGS
-# =========================================
+# ==========================================
+# 1. SETTINGS
+# ==========================================
 
 $BotToken = "8715775001:AAGivZLOBG_YdpCuMlX6JIbFusUI5ofZ8Sk"
-$ProxyPort = 1080
 
-# Telegram recipients and SOCKS5 usernames
 $Recipients = @(
-    @{ ChatId = "8640543929"; Username = "user1" },
-    @{ ChatId = "8362186234"; Username = "user2" },
+    @{
+        ChatId = "8362186234"
+        Username = "sovdev"
+    },
+    @{
+        ChatId = "8640543929"
+        Username = "jimbo"
+    },
 )
 
-$InstallDir = "$env:ProgramData\MySocks5"
-$ConfigFile = "$InstallDir\3proxy.cfg"
+$ProxyPort = 1080
+
+# Set to public DDNS domain if available.
+# Leave empty to send the detected public IPv4.
+$PublicHost = ""
+
+# Restrict incoming IPs if known.
+# Example: @("203.0.113.10", "198.51.100.25")
+# Empty means any remote IP can attempt login.
+$AllowedClientIPs = @()
+
+$InstallDir = Join-Path $env:ProgramData "MySocks5"
+$ConfigFile = Join-Path $InstallDir "3proxy.cfg"
 $ServiceName = "3proxy"
-$FirewallRule = "MySocks5-LAN"
 
-# =========================================
-# VALIDATION
-# =========================================
+# ==========================================
+# 2. HELPER FUNCTIONS
+# ==========================================
 
-if ($BotToken -eq "YOUR_BOT_TOKEN") {
-    throw "Configure Telegram BotToken first."
-}
-
-if (-not $Recipients -or $Recipients.Count -eq 0) {
-    throw "At least one recipient is required."
-}
-
-$Names = @()
-
-foreach ($Recipient in $Recipients) {
-    if ($Recipient.Username -notmatch '^[a-zA-Z0-9_]+$') {
-        throw "Invalid username: $($Recipient.Username)"
-    }
-
-    if ($Recipient.ChatId -notmatch '^-?[0-9]+$') {
-        throw "Invalid Telegram ChatId."
-    }
-
-    if ($Names -contains $Recipient.Username) {
-        throw "Duplicate proxy username."
-    }
-
-    $Names += $Recipient.Username
-}
-
-if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
-    throw "An existing 3proxy service was detected. This script does not overwrite it."
-}
-
-# =========================================
-# HELPERS
-# =========================================
-
-function New-SecurePassword {
-    param([int]$Length = 24)
-
-    $Alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    $Bytes = New-Object byte[] $Length
+function New-ProxyPassword {
+    $Chars = "abcdefghijkmnopqrstuvwxyz" +
+             "ABCDEFGHJKLMNPQRSTUVWXYZ" +
+             "23456789"
 
     $Rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $Bytes = New-Object byte[] 24
 
     try {
         $Rng.GetBytes($Bytes)
@@ -76,9 +56,14 @@ function New-SecurePassword {
         $Rng.Dispose()
     }
 
-    return -join ($Bytes | ForEach-Object {
-        $Alphabet[[int]($_ % $Alphabet.Length)]
-    })
+    $Password = ""
+
+    foreach ($Byte in $Bytes) {
+        $Index = [int]($Byte % $Chars.Length)
+        $Password += $Chars[$Index]
+    }
+
+    return $Password
 }
 
 function Send-Telegram {
@@ -87,11 +72,11 @@ function Send-Telegram {
         [string]$Message
     )
 
-    $Url = "https://api.telegram.org/bot$BotToken/sendMessage"
+    $Uri = "https://api.telegram.org/bot$BotToken/sendMessage"
 
     try {
-        $Result = Invoke-RestMethod `
-            -Uri $Url `
+        $Response = Invoke-RestMethod `
+            -Uri $Uri `
             -Method Post `
             -Body @{
                 chat_id = $ChatId
@@ -99,25 +84,59 @@ function Send-Telegram {
             } `
             -TimeoutSec 20
 
-        if ($Result.ok) {
-            Write-Host "[OK] Telegram: $ChatId"
+        if ($Response.ok) {
+            Write-Host "[OK] Sent to $ChatId"
             return $true
         }
     }
     catch {
-        Write-Warning "Telegram failed for $ChatId : $($_.Exception.Message)"
+        Write-Warning ("Telegram error for {0}: {1}" -f `
+            $ChatId, $_.Exception.Message)
     }
 
     return $false
 }
 
-# =========================================
-# DETECT LOCAL IP
-# =========================================
+# ==========================================
+# 3. CHECK INPUT
+# ==========================================
 
-Write-Host "[1/7] Detecting network..."
+Write-Host "[1/8] Checking configuration..."
 
-$Interface = Get-NetIPConfiguration |
+if ($BotToken -eq "YOUR_BOT_TOKEN") {
+    throw "Set your Telegram bot token."
+}
+
+if ($Recipients.Count -eq 0) {
+    throw "Configure at least one recipient."
+}
+
+$SeenUsers = @()
+
+foreach ($Recipient in $Recipients) {
+
+    if ($Recipient.Username -notmatch '^[a-zA-Z0-9_]+$') {
+        throw "Invalid SOCKS5 username."
+    }
+
+    if ($Recipient.ChatId -notmatch '^[0-9]+$') {
+        throw "Invalid Telegram chat ID."
+    }
+
+    if ($SeenUsers -contains $Recipient.Username) {
+        throw "Duplicate SOCKS5 username."
+    }
+
+    $SeenUsers += $Recipient.Username
+}
+
+# ==========================================
+# 4. FIND LAN / PUBLIC IP
+# ==========================================
+
+Write-Host "[2/8] Detecting network..."
+
+$Network = Get-NetIPConfiguration |
     Where-Object {
         $_.IPv4DefaultGateway -and
         $_.IPv4Address -and
@@ -125,34 +144,66 @@ $Interface = Get-NetIPConfiguration |
     } |
     Select-Object -First 1
 
-if (-not $Interface) {
-    throw "No active IPv4 network interface found."
+if (-not $Network) {
+    throw "Active IPv4 connection not found."
 }
 
-$LANIP = $Interface.IPv4Address[0].IPAddress
+$LocalIP = $Network.IPv4Address[0].IPAddress
 
-Write-Host "Local IP: $LANIP"
+$DetectedPublicIP = ""
 
-# =========================================
-# DOWNLOAD 3PROXY
-# =========================================
+try {
+    $DetectedPublicIP = [string](
+        Invoke-RestMethod `
+            -Uri "https://api.ipify.org" `
+            -TimeoutSec 15
+    )
+}
+catch {
+    Write-Warning "Public IP detection failed."
+}
 
-Write-Host "[2/7] Downloading 3proxy..."
+if ([string]::IsNullOrWhiteSpace($PublicHost)) {
+    $PublicHost = $DetectedPublicIP
+}
 
-New-Item -Path $InstallDir -ItemType Directory -Force |
-    Out-Null
+if ([string]::IsNullOrWhiteSpace($PublicHost)) {
+    $PublicHost = "PUBLIC_IP_NOT_DETECTED"
+}
+
+Write-Host "LAN IPv4: $LocalIP"
+Write-Host "Public IPv4: $DetectedPublicIP"
+Write-Host "Proxy host: $PublicHost"
+
+# ==========================================
+# 5. DOWNLOAD OFFICIAL 3PROXY
+# ==========================================
+
+Write-Host "[3/8] Preparing 3proxy..."
+
+New-Item -ItemType Directory `
+    -Path $InstallDir -Force | Out-Null
+
+$ExistingService = Get-Service `
+    -Name $ServiceName `
+    -ErrorAction SilentlyContinue
+
+if ($ExistingService) {
+    throw "3proxy service already exists. Backup or remove the old installation first."
+}
 
 $Release = Invoke-RestMethod `
-    -Uri "https://api.github.com/repos/3proxy/3proxy/releases/latest"
+    -Uri "https://api.github.com/repos/3proxy/3proxy/releases/latest" `
+    -Headers @{ "User-Agent" = "PowerShell-Socks5-Setup" }
 
 $Asset = $Release.assets |
     Where-Object {
-        $_.name -match '^3proxy-[0-9.]+-x64\.zip$'
+        $_.name -match '3proxy.*x64\.zip$'
     } |
     Select-Object -First 1
 
 if (-not $Asset) {
-    throw "Windows x64 release not found."
+    throw "Windows x64 ZIP release not found."
 }
 
 $ZipPath = Join-Path $InstallDir "3proxy.zip"
@@ -161,13 +212,12 @@ Invoke-WebRequest `
     -Uri $Asset.browser_download_url `
     -OutFile $ZipPath
 
-# Verify integrity if the release provides a SHA256 digest
-if ($Asset.digest -and $Asset.digest -match '^sha256:([a-fA-F0-9]{64})$') {
-    $ExpectedHash = $Matches[1].ToLowerInvariant()
-    $ActualHash = (Get-FileHash $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($Asset.digest -match '^sha256:([a-fA-F0-9]{64})$') {
+    $Expected = $Matches[1].ToLower()
+    $Actual = (Get-FileHash $ZipPath -Algorithm SHA256).Hash.ToLower()
 
-    if ($ActualHash -ne $ExpectedHash) {
-        throw "3proxy download checksum mismatch."
+    if ($Expected -ne $Actual) {
+        throw "Downloaded file failed SHA256 verification."
     }
 }
 
@@ -178,26 +228,29 @@ Expand-Archive `
 
 Remove-Item $ZipPath -Force
 
-$ProxyExe = Get-ChildItem $InstallDir -Recurse -File |
-    Where-Object { $_.Name -eq "3proxy.exe" } |
+$ProxyExe = Get-ChildItem `
+    -Path $InstallDir `
+    -Recurse `
+    -Filter "3proxy.exe" `
+    -File |
     Select-Object -First 1 -ExpandProperty FullName
 
 if (-not $ProxyExe) {
-    throw "3proxy.exe not found."
+    throw "3proxy.exe not found in archive."
 }
 
-# =========================================
-# CREATE USERS
-# =========================================
+# ==========================================
+# 6. GENERATE INDIVIDUAL ACCOUNTS
+# ==========================================
 
-Write-Host "[3/7] Creating proxy accounts..."
+Write-Host "[4/8] Creating accounts..."
 
 $Accounts = @()
-$UserEntries = @()
+$Credentials = @()
 
 foreach ($Recipient in $Recipients) {
 
-    $Password = New-SecurePassword
+    $Password = New-ProxyPassword
 
     $Accounts += [PSCustomObject]@{
         ChatId = $Recipient.ChatId
@@ -205,19 +258,19 @@ foreach ($Recipient in $Recipients) {
         Password = $Password
     }
 
-    $UserEntries += "$($Recipient.Username):CL:$Password"
-
-    Write-Host "Created: $($Recipient.Username)"
+    $Credentials += (
+        "{0}:CL:{1}" -f $Recipient.Username, $Password
+    )
 }
 
-$UsersLine = "users " + ($UserEntries -join " ")
+$UsersLine = "users " + ($Credentials -join " ")
 $AllowedUsers = ($Accounts.Username -join ",")
 
-# =========================================
-# CREATE CONFIG
-# =========================================
+# ==========================================
+# 7. CREATE CONFIGURATION
+# ==========================================
 
-Write-Host "[4/7] Writing configuration..."
+Write-Host "[5/8] Configuring proxy..."
 
 $Config = @"
 maxconn 100
@@ -228,7 +281,7 @@ nscache 65536
 $UsersLine
 auth strong
 allow $AllowedUsers
-socks -p$ProxyPort -i$LANIP
+socks -p$ProxyPort -i$LocalIP
 flush
 "@
 
@@ -237,91 +290,91 @@ Set-Content `
     -Value $Config `
     -Encoding ASCII
 
-# Protect credentials and installation directory
+# Protect configuration and credentials.
 & icacls.exe $InstallDir /inheritance:r `
     /grant:r "*S-1-5-18:(OI)(CI)F" `
-             "*S-1-5-32-544:(OI)(CI)F" /T | Out-Null
+    "*S-1-5-32-544:(OI)(CI)F" /T | Out-Null
 
 if ($LASTEXITCODE -ne 0) {
-    throw "Failed to secure installation directory."
+    throw "Unable to secure installation directory."
 }
 
-# =========================================
-# WINDOWS SERVICE
-# =========================================
+# ==========================================
+# 8. INSTALL WINDOWS SERVICE
+# ==========================================
 
-Write-Host "[5/7] Installing service..."
+Write-Host "[6/8] Installing service..."
 
 & $ProxyExe $ConfigFile --install
 
-if ($LASTEXITCODE -ne 0) {
-    throw "Service installation failed."
-}
+Start-Sleep -Seconds 3
 
-Start-Sleep -Seconds 2
-
-$Service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+$Service = Get-Service `
+    -Name $ServiceName `
+    -ErrorAction SilentlyContinue
 
 if (-not $Service) {
-    throw "3proxy service not found."
+    throw "3proxy service was not installed."
 }
 
 if ($Service.Status -ne "Running") {
     Start-Service -Name $ServiceName
 }
 
-Set-Service -Name $ServiceName -StartupType Automatic
+Set-Service `
+    -Name $ServiceName `
+    -StartupType Automatic
+
+# ==========================================
+# 9. FIREWALL
+# ==========================================
+
+Write-Host "[7/8] Configuring Windows Firewall..."
+
+$RuleName = "Custom SOCKS5 TCP $ProxyPort"
+
+$RemoteAddresses = "Any"
+
+if ($AllowedClientIPs.Count -gt 0) {
+    $RemoteAddresses = $AllowedClientIPs
+}
+
+New-NetFirewallRule `
+    -DisplayName $RuleName `
+    -Direction Inbound `
+    -Action Allow `
+    -Protocol TCP `
+    -LocalAddress $LocalIP `
+    -LocalPort $ProxyPort `
+    -RemoteAddress $RemoteAddresses `
+    -Profile Private `
+    -ErrorAction Stop | Out-Null
 
 Start-Sleep -Seconds 2
 
 $Service = Get-Service -Name $ServiceName
 
 if ($Service.Status -ne "Running") {
-    throw "Proxy service is not running."
+    throw "3proxy service is not running."
 }
 
-# =========================================
-# WINDOWS FIREWALL
-# =========================================
-
-Write-Host "[6/7] Configuring firewall..."
-
-Get-NetFirewallRule -DisplayName $FirewallRule `
-    -ErrorAction SilentlyContinue |
-    Remove-NetFirewallRule
-
-New-NetFirewallRule `
-    -DisplayName $FirewallRule `
-    -Direction Inbound `
-    -Action Allow `
-    -Protocol TCP `
-    -LocalAddress $LANIP `
-    -LocalPort $ProxyPort `
-    -RemoteAddress LocalSubnet `
-    -Profile Private `
-    -ErrorAction Stop | Out-Null
-
-# =========================================
-# VERIFY PORT
-# =========================================
-
-$Check = Test-NetConnection `
-    -ComputerName $LANIP `
+$Listening = Test-NetConnection `
+    -ComputerName $LocalIP `
     -Port $ProxyPort `
     -WarningAction SilentlyContinue
 
-if (-not $Check.TcpTestSucceeded) {
-    throw "SOCKS5 port is not accepting TCP connections."
+if (-not $Listening.TcpTestSucceeded) {
+    throw "Proxy port is not listening."
 }
 
-# =========================================
-# TELEGRAM BROADCAST
-# =========================================
+# ==========================================
+# 10. SEND DETAILS TO TELEGRAM
+# ==========================================
 
-Write-Host "[7/7] Sending proxy details..."
+Write-Host "[8/8] Sending Telegram messages..."
 
-$Success = 0
-$Failed = 0
+$SentCount = 0
+$FailedCount = 0
 
 foreach ($Account in $Accounts) {
 
@@ -331,52 +384,55 @@ SOCKS5 PROXY READY
 Computer: $env:COMPUTERNAME
 
 Protocol: SOCKS5
-Host: $LANIP
+Host: $PublicHost
 Port: $ProxyPort
 
 Username: $($Account.Username)
 Password: $($Account.Password)
 
-Authentication: Enabled
-Access: Local network only
+LAN address: $LocalIP
+Windows service: Running
 
-Configure your SOCKS5 client with these credentials.
+IMPORTANT:
+External access requires router port forwarding.
+SOCKS5 authentication is not encrypted.
 "@
 
-    $Sent = Send-Telegram `
+    $Result = Send-Telegram `
         -ChatId $Account.ChatId `
         -Message $Message
 
-    if ($Sent) {
-        $Success++
+    if ($Result) {
+        $SentCount++
     }
     else {
-        $Failed++
+        $FailedCount++
     }
 
     Start-Sleep -Milliseconds 500
 }
 
-# =========================================
-# SUMMARY
-# =========================================
+# ==========================================
+# 11. SUMMARY
+# ==========================================
 
 Write-Host ""
-Write-Host "======================================"
-Write-Host "SOCKS5 SETUP FINISHED"
-Write-Host "======================================"
-Write-Host "Host: $LANIP"
-Write-Host "Port: $ProxyPort"
-Write-Host "Service: $ServiceName"
-Write-Host "Status: $($Service.Status)"
-Write-Host "Telegram sent: $Success"
-Write-Host "Telegram failed: $Failed"
-Write-Host "======================================"
-
+Write-Host "========================================"
+Write-Host "SOCKS5 SERVER SETUP COMPLETED"
+Write-Host "========================================"
+Write-Host "Local IP:      $LocalIP"
+Write-Host "Public IP:     $DetectedPublicIP"
+Write-Host "Proxy Host:    $PublicHost"
+Write-Host "Port:          $ProxyPort"
+Write-Host "Service:       $($Service.Status)"
+Write-Host "Sent:          $SentCount"
+Write-Host "Failed:        $FailedCount"
+Write-Host "========================================"
 Write-Host ""
-Write-Host "Proxy accounts:"
-$Accounts | Select-Object ChatId, Username |
-    Format-Table -AutoSize
-
+Write-Host "NEXT STEP:"
+Write-Host "Forward TCP port $ProxyPort on your router"
+Write-Host "to $LocalIP port $ProxyPort."
 Write-Host ""
-Write-Host "Completed."
+Write-Host "Reserve the PC LAN IP in router DHCP settings."
+Write-Host ""
+Write-Host "Never share bot token publicly."
