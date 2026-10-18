@@ -19,7 +19,7 @@ $Recipients = @(
     @{
         ChatId = "8640543929"
         Username = "jimbo"
-    },
+    }
 )
 
 $ProxyPort = 1080
