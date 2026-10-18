@@ -206,7 +206,11 @@ if (-not $Asset) {
     throw "Windows x64 ZIP release not found."
 }
 
-$ZipPath = Join-Path $InstallDir "3proxy.zip"
+$ZipPath = Join-Path $env:TEMP "3proxy-download.zip"
+
+if (Test-Path $ZipPath) {
+    Remove-Item $ZipPath -Force
+}
 
 Invoke-WebRequest `
     -Uri $Asset.browser_download_url `
