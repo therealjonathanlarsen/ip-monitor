@@ -1,7 +1,8 @@
-# Network Intelligence Scanner v2.1
+# Network Intelligence Scanner v2.3
 # Run on a computer you own or have permission to diagnose.
 # Windows PowerShell 5.1+ / PowerShell 7+
-# This script NEVER sends a report without displaying it and asking for YES.
+# This script never captures or sends a screenshot without separate explicit consent.
+# Network report sharing also requires explicit consent.
 
 $ErrorActionPreference = 'Stop'
 
@@ -35,14 +36,19 @@ function Get-RemoteJson([string]$uri) {
     catch { Write-Warning "Request failed: $($_.Exception.Message)"; return $null }
 }
 
-Write-Host 'Network Intelligence Scanner v2.1' -ForegroundColor Cyan
+Write-Host 'Network Intelligence Scanner v2.3' -ForegroundColor Cyan
 Write-Host 'Collecting network diagnostics locally...' -ForegroundColor Gray
 
 # Public IPv4 and IPv6 independently (VPN may affect results).
 $v4Response = Get-RemoteJson 'https://api4.ipify.org?format=json'
-$v6Response = Get-RemoteJson 'https://api6.ipify.org?format=json'
+# IPv6 is optional. Failure here is expected on IPv4-only networks.
+try {
+    $v6Response = Invoke-RestMethod -Uri 'https://api6.ipify.org?format=json' -TimeoutSec 5 -ErrorAction Stop
+} catch {
+    $v6Response = $null
+}
 $ipv4 = SafeValue $v4Response.ip
-$ipv6 = SafeValue $v6Response.ip
+$ipv6 = if ($null -eq $v6Response) { 'Not available' } else { SafeValue $v6Response.ip }
 
 # IP ownership and security intelligence. Full flags require optional API key.
 $apiKey = $env:IPAPI_IS_KEY
@@ -143,23 +149,66 @@ $rowsText = $rows -join "`n"
 $localHtml = @"
 <!doctype html><html lang="en"><head><meta charset="utf-8"><title>Network Scan</title>
 <style>body{font-family:Segoe UI,Arial,sans-serif;max-width:900px;margin:40px auto;padding:0 18px;background:#f5f7fb;color:#202b39}table{width:100%;border-collapse:collapse;background:white}th,td{text-align:left;border-bottom:1px solid #dce3eb;padding:12px}th{width:38%;background:#edf2f7}h1{font-size:24px}p{color:#566}</style></head><body>
-<h1>Network Intelligence Scanner v2.1</h1><p>Results are estimates; IP reputation is not definitive.</p>
+<h1>Network Intelligence Scanner v2.3</h1><p>Results are estimates; IP reputation is not definitive.</p>
 <table>$rowsText</table></body></html>
 "@
 $localHtml | Set-Content -Path $htmlPath -Encoding UTF8
 Write-Host "`nSaved JSON: $jsonPath" -ForegroundColor Green
 Write-Host "Saved HTML: $htmlPath" -ForegroundColor Green
 
+# Optional screenshot: user must opt in BEFORE capture.
+# Capture only the primary display. Preview it before offering to share.
+$screenshotPath = $null
+Write-Host "`nOPTIONAL SCREENSHOT" -ForegroundColor Cyan
+Write-Host 'A screenshot can contain private messages, passwords and other sensitive data.' -ForegroundColor Yellow
+$captureAnswer = (Read-Host 'Capture the primary screen for local preview? Type YES to allow').Trim()
+if ($captureAnswer -eq 'YES') {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+        $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+        $bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+        try {
+            $graphics = [System.Drawing.Graphics]::FromImage($bmp)
+            try {
+                $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+                $screenshotPath = Join-Path $reportDir "screenshot-$filename.png"
+                $bmp.Save($screenshotPath, [System.Drawing.Imaging.ImageFormat]::Png)
+            } finally {
+                if ($graphics) { $graphics.Dispose() }
+            }
+        } finally {
+            $bmp.Dispose()
+        }
+        Write-Host "Screenshot saved: $screenshotPath" -ForegroundColor Green
+        Write-Host 'Review the image before deciding whether to share it.' -ForegroundColor Yellow
+        Start-Process -FilePath $screenshotPath
+        Read-Host 'Review the screenshot, then press Enter to continue'
+    } catch {
+        $screenshotPath = $null
+        Write-Warning "Screenshot not captured: $($_.Exception.Message)"
+    }
+}
+
+# Screenshot permission is independent from permission to share network data.
+$sendScreenshot = $false
+if ($screenshotPath -and (Test-Path -LiteralPath $screenshotPath)) {
+    Write-Host "Screenshot recipient chats: $($chatIds -join ', ')" -ForegroundColor Yellow
+    $screenshotAnswer = (Read-Host 'Send this reviewed screenshot to BOTH Telegram chats? Type YES to confirm').Trim()
+    $sendScreenshot = ($screenshotAnswer -eq 'YES')
+}
+
 # Explicit opt-in: no automatic sharing of device/network information.
 Write-Host "`nRecipients: $($chatIds -join ', ')" -ForegroundColor Yellow
-$consent = Read-Host 'Send this network report to BOTH Telegram chats? Type YES to confirm'
-if ($consent -cne 'YES') { Write-Host 'No data sent to Telegram.'; Read-Host 'Press Enter to close'; exit 0 }
+$consent = (Read-Host 'Send this network report to BOTH Telegram chats? Type YES to confirm').Trim()
+if ($consent -ne 'YES' -and -not $sendScreenshot) { Write-Host 'No data sent to Telegram.'; Read-Host 'Press Enter to close'; exit 0 }
 
 # Telegram Rich Message HTML table (Bot API sendRichMessage).
 $tgRows = foreach ($entry in $report.GetEnumerator()) {
     '<tr><td>' + (Html $entry.Key) + '</td><td>' + (Html $entry.Value) + '</td></tr>'
 }
 $telegramHtml = '<h3>NEW HOTSPOT AVAILABLE</h3><table><tr><th>Parameter</th><th>Value</th></tr>' + ($tgRows -join '') + '</table>'
+if ($consent -eq 'YES') {
 foreach ($chatId in $chatIds) {
     try {
         $payload = @{ chat_id=$chatId; rich_message=@{ html=$telegramHtml } } | ConvertTo-Json -Depth 6 -Compress
@@ -168,8 +217,54 @@ foreach ($chatId in $chatIds) {
             -Method Post -Body $utf8 -ContentType 'application/json; charset=utf-8' -TimeoutSec 20
         Write-Host "Sent to chat $chatId" -ForegroundColor Green
     } catch {
-        Write-Warning "Telegram delivery to chat $chatId failed: $($_.Exception.Message)"
+        Write-Warning "Rich table failed for chat ${chatId}: $($_.Exception.Message). Trying regular Telegram message."
+        try {
+            # Standard HTML formatting is supported by the regular Bot API.
+            # Plain rows are more compatible than rich tables on older clients.
+            $lines = foreach ($entry in $report.GetEnumerator()) {
+                '<b>' + (Html $entry.Key) + ':</b> ' + (Html $entry.Value)
+            }
+            $fallbackText = '<b>NEW HOTSPOT AVAILABLE</b>' + "`n`n" + ($lines -join "`n")
+            $body = @{ chat_id=$chatId; text=$fallbackText; parse_mode='HTML' } | ConvertTo-Json -Compress
+            $null = Invoke-RestMethod -Uri "https://api.telegram.org/bot$botToken/sendMessage" `
+                -Method Post -Body ([Text.Encoding]::UTF8.GetBytes($body)) `
+                -ContentType 'application/json; charset=utf-8' -TimeoutSec 20 -ErrorAction Stop
+            Write-Host "Sent standard message to chat $chatId" -ForegroundColor Green
+        } catch {
+            Write-Warning "Telegram delivery to chat ${chatId} failed: $($_.Exception.Message)"
+        }
+    }
+}
+}
+
+# Only send the screenshot if it was reviewed AND independently authorized.
+if ($sendScreenshot -and $screenshotPath -and (Test-Path -LiteralPath $screenshotPath)) {
+    foreach ($chatId in $chatIds) {
+        try {
+            # Windows PowerShell 5.1 supports multipart upload using HttpClient.
+            Add-Type -AssemblyName System.Net.Http
+            $client = New-Object System.Net.Http.HttpClient
+            $multipart = New-Object System.Net.Http.MultipartFormDataContent
+            $stream = [System.IO.File]::OpenRead($screenshotPath)
+            $content = New-Object System.Net.Http.StreamContent($stream)
+            try {
+                $content.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse('image/png')
+                $multipart.Add((New-Object System.Net.Http.StringContent([string]$chatId)), 'chat_id')
+                $multipart.Add((New-Object System.Net.Http.StringContent('Reviewed screenshot - Network Intelligence Scanner v2.3')), 'caption')
+                $multipart.Add($content, 'photo', 'screenshot.png')
+                $response = $client.PostAsync("https://api.telegram.org/bot$botToken/sendPhoto", $multipart).GetAwaiter().GetResult()
+                $response.EnsureSuccessStatusCode() | Out-Null
+                Write-Host "Screenshot sent to chat $chatId" -ForegroundColor Green
+            } finally {
+                $content.Dispose()
+                $stream.Dispose()
+                $multipart.Dispose()
+                $client.Dispose()
+            }
+        } catch {
+            Write-Warning "Screenshot delivery to chat ${chatId} failed: $($_.Exception.Message)"
+        }
     }
 }
 $botToken = $null
-Read-Host 'Press Enter to close'
+Read-Host 'Press Enter to close' 
