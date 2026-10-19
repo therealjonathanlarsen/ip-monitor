@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-Network Security Auditor v4 - opt-in Windows Location + PNG infographic.
+Network Security Auditor v6 - verified local screenshot + desktop overlay.
 Windows 10/11, PowerShell 5.1+. No credential extraction, no remote subnet scan.
 External services: ipify, ipwho.is, api.ipapi.is (optional key), bash.ws,
 Google/Cloudflare STUN servers, Telegram Bot API (explicitly configured).
@@ -14,6 +14,7 @@ param(
     [switch]$SkipBrowserTest,
     [switch]$CheckGatewayPorts,
     [switch]$TestTelegramOnly,
+    [switch]$TestScreenshotOnly,
     [switch]$EnableDeviceLocation,
     [switch]$ReverseGeocode,
     [switch]$SharePreciseLocationInTelegram,
@@ -568,21 +569,28 @@ function New-AuditPng([string]$FilePath,$Lines,[int]$Score,[string]$Grade) {
         }
     }
 
-    $screenDrawn=$true
+    # Screenshot is always opt-in. Never replace a failed capture with a fake screenshot.
+    $permission=Read-Host 'Capture YOUR VISIBLE desktop now? Type CAPTURE / Для снимка экрана введите CAPTURE'
+    if($permission -cne 'CAPTURE') { throw 'Screen capture cancelled; no screenshot created or sent.' }
+
     $bmp=$null; $g=$null
+    $rawPath=[IO.Path]::Combine([IO.Path]::GetDirectoryName($FilePath),([IO.Path]::GetFileNameWithoutExtension($FilePath) + '_raw.png'))
     try {
         $vs=[System.Windows.Forms.SystemInformation]::VirtualScreen
-        if($vs.Width -le 0 -or $vs.Height -le 0) { throw 'Virtual screen size unavailable' }
-        $bmp=New-Object System.Drawing.Bitmap($vs.Width,$vs.Height)
+        if($vs.Width -le 0 -or $vs.Height -le 0) { throw 'Invalid virtual-screen bounds; use an unlocked interactive Windows desktop.' }
+        Write-Host ('Capturing desktop region: '+$vs.Width+'x'+$vs.Height+' at '+$vs.Left+','+$vs.Top) -ForegroundColor Cyan
+        $bmp=[System.Drawing.Bitmap]::new($vs.Width,$vs.Height,[System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
         $g=[System.Drawing.Graphics]::FromImage($bmp)
-        $g.CopyFromScreen($vs.Left,$vs.Top,0,0,$bmp.Size)
+        $g.CopyFromScreen($vs.Left,$vs.Top,0,0,$bmp.Size,[System.Drawing.CopyPixelOperation]::SourceCopy)
+        $bmp.Save($rawPath,[System.Drawing.Imaging.ImageFormat]::Png)
+        if(-not (Test-Path -LiteralPath $rawPath) -or (Get-Item -LiteralPath $rawPath).Length -lt 1000) {
+            throw 'Raw screenshot not saved or suspiciously small.'
+        }
+        Write-Host ('RAW DESKTOP SCREENSHOT saved: '+$rawPath) -ForegroundColor Green
     } catch {
-        $screenDrawn=$false
         if($g){$g.Dispose();$g=$null}
         if($bmp){$bmp.Dispose();$bmp=$null}
-        $bmp=New-Object System.Drawing.Bitmap(1600,900)
-        $g=[System.Drawing.Graphics]::FromImage($bmp)
-        $g.Clear([System.Drawing.Color]::FromArgb(18,24,36))
+        throw ('ACTUAL SCREEN CAPTURE FAILED: '+$_.Exception.Message+'; unlock the desktop and run in your interactive Windows session.')
     }
 
     $titleFont=$null;$headFont=$null;$bodyFont=$null;$smallFont=$null
@@ -618,9 +626,9 @@ function New-AuditPng([string]$FilePath,$Lines,[int]$Score,[string]$Grade) {
         $panelHeight += 42
         if($panelHeight -gt ($bmp.Height-70)) { $panelHeight = $bmp.Height-70 }
 
-        $panelRect=New-Object System.Drawing.Rectangle($x,$y,$panelWidth,$panelHeight)
-        $titleRect=New-Object System.Drawing.Rectangle($x,$y,$panelWidth,62)
-        $badgeRect=New-Object System.Drawing.Rectangle(($x+$panelWidth-155),($y+12),122,38)
+        $panelRect=[System.Drawing.Rectangle]::new($x,$y,$panelWidth,$panelHeight)
+        $titleRect=[System.Drawing.Rectangle]::new($x,$y,$panelWidth,62)
+        $badgeRect=[System.Drawing.Rectangle]::new(($x+$panelWidth-155),($y+12),122,38)
 
         $g.FillRectangle($shadowBrush,($x+6),($y+7),$panelWidth,$panelHeight)
         $g.FillRectangle($panelBrush,$panelRect)
@@ -633,9 +641,6 @@ function New-AuditPng([string]$FilePath,$Lines,[int]$Score,[string]$Grade) {
         $g.DrawString(("{0}/100" -f $Score), $headFont, $whiteBrush, ($badgeRect.X+12), ($badgeRect.Y+10))
         $g.DrawString($Grade, $smallFont, $whiteBrush, ($badgeRect.X+74), ($badgeRect.Y+11))
 
-        if(-not $screenDrawn) {
-            $g.DrawString('Screen capture unavailable -> fallback background used', $smallFont, $warnBrush, ($x+18), ($y+$panelHeight-28))
-        }
 
         $cursorY=$y+78
         foreach($line in $expanded) {
@@ -663,6 +668,10 @@ function New-AuditPng([string]$FilePath,$Lines,[int]$Score,[string]$Grade) {
         $g.DrawString('Sensitive desktop content may be visible in the screenshot.', $smallFont, $mutedBrush, ($x+280), ($y+$panelHeight-26))
 
         $bmp.Save($FilePath,[System.Drawing.Imaging.ImageFormat]::Png)
+        if(-not (Test-Path -LiteralPath $FilePath) -or (Get-Item -LiteralPath $FilePath).Length -lt 1000) {
+            throw 'Overlay screenshot not saved or suspiciously small.'
+        }
+        Write-Host ('OVERLAY SCREENSHOT saved: '+$FilePath) -ForegroundColor Green
     }
     finally {
         foreach($obj in @($g,$bmp,$titleFont,$headFont,$bodyFont,$smallFont,$whiteBrush,$mutedBrush,$accentBrush,$warnBrush,$shadowBrush,$panelBrush,$titleBarBrush,$badgeBrush,$linePen,$edgePen)) {
@@ -672,6 +681,10 @@ function New-AuditPng([string]$FilePath,$Lines,[int]$Score,[string]$Grade) {
 }
 function Send-TgPhoto([string]$Path) {
     if(-not ($SendTelegram -and $SendReportImage) -or -not (Test-Path -LiteralPath $Path)){return}
+    Write-Host ('SCREENSHOT PREVIEW: '+$Path) -ForegroundColor Yellow
+    try { Start-Process -FilePath $Path -ErrorAction Stop | Out-Null } catch { Write-Warning ('Preview unavailable: '+$_.Exception.Message) }
+    $decision=Read-Host ('Send this VISIBLE-DESKTOP screenshot to Telegram chat IDs '+$TelegramChatIds+'? Type SEND / Отправить? Введите SEND')
+    if($decision -cne 'SEND') { Write-Host 'Screen image not sent to Telegram (you declined).' -ForegroundColor Yellow; return }
     $http=New-Object System.Net.Http.HttpClient
     try {
         foreach($chatId in (Tg-TargetIds)) {
@@ -688,10 +701,28 @@ function Send-TgPhoto([string]$Path) {
                 if(-not $script:sentTo.Contains([string]$chatId)){$script:sentTo.Add([string]$chatId)}
             } catch {
                 $clean=$_.Exception.Message.Replace($TelegramBotToken,'[BOT_TOKEN_REDACTED]')
-                $script:telegramFailures.Add("Chat $chatId image: $clean")
+                $script:telegramFailures.Add("Chat $chatId screenshot image: $clean")
             } finally { if($null -ne $form){$form.Dispose()} }
         }
     }finally{$http.Dispose()}
+}
+
+if($TestScreenshotOnly) {
+    Write-Host 'SCREENSHOT SELF-TEST. No network scan and NO Telegram upload.' -ForegroundColor Cyan
+    $selfTestFile=Join-Path $OutputDir ('screen_test_'+$stamp+'_overlay.png')
+    $selfTestRows=@(
+        [pscustomobject]@{kind='section';text='SCREEN CAPTURE SELF-TEST / ПРОВЕРКА СНИМКА'},
+        [pscustomobject]@{kind='row';text=('Windows desktop screenshot / Скриншот Windows')},
+        [pscustomobject]@{kind='row';text=('Time / Время: '+(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))},
+        [pscustomobject]@{kind='row';text='This is a visual test, NOT a security audit.'}
+    )
+    try {
+        New-AuditPng $selfTestFile $selfTestRows 0 'TEST'
+        Write-Host ('Screen test overlay: '+$selfTestFile) -ForegroundColor Green
+        Write-Host ('Screen test raw: '+([IO.Path]::Combine([IO.Path]::GetDirectoryName($selfTestFile),([IO.Path]::GetFileNameWithoutExtension($selfTestFile)+'_raw.png')))) -ForegroundColor Green
+        Start-Process -FilePath $selfTestFile
+    } catch { Write-Error ('Screen test failed: '+$_.Exception.Message) }
+    return
 }
 
 if($TestTelegramOnly) {
@@ -1052,7 +1083,7 @@ if($SendReportImage) {
       [pscustomobject]@{kind='row';text=$assessment.local_summary_ru},
       [pscustomobject]@{kind='row';text=$assessment.local_summary_en}
     )
-    try { New-AuditPng $pngPath $pngRows $score $tier }catch{$script:errorsList.Add('PNG report: '+$_.Exception.Message);Write-Warning ('Screen overlay image creation failed: '+$_.Exception.Message)}
+    try { New-AuditPng $pngPath $pngRows $score $tier }catch{$script:errorsList.Add('Screenshot: '+$_.Exception.Message);Write-Warning ('Real screenshot capture failed (NO substitute image): '+$_.Exception.Message)}
 }
 if($SendTelegram) {
     if([string]::IsNullOrWhiteSpace($TelegramBotToken) -or $TelegramBotToken -eq 'PASTE_NEW_BOT_TOKEN_HERE') {
