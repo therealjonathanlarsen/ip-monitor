@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-Network Security Auditor v3 - local, read-only diagnostics.
+Network Security Auditor v4 - opt-in Windows Location + PNG infographic.
 Windows 10/11, PowerShell 5.1+. No credential extraction, no remote subnet scan.
 External services: ipify, ipwho.is, api.ipapi.is (optional key), bash.ws,
 Google/Cloudflare STUN servers, Telegram Bot API (explicitly configured).
@@ -14,6 +14,10 @@ param(
     [switch]$SkipBrowserTest,
     [switch]$CheckGatewayPorts,
     [switch]$TestTelegramOnly,
+    [switch]$EnableDeviceLocation,
+    [switch]$ReverseGeocode,
+    [switch]$SharePreciseLocationInTelegram,
+    [switch]$SendReportImage = $true,
     [string]$OutputDir = (Join-Path $env:USERPROFILE 'Documents\NetworkAudit'),
     [string]$TelegramBotToken = '8715775001:AAGivZLOBG_YdpCuMlX6JIbFusUI5ofZ8Sk',
     [string]$TelegramChatIds = '8640543929,8362186234',
@@ -463,6 +467,164 @@ function Send-TgDocument([string]$Path) {
         }
     }finally{$http.Dispose()}
 }
+function Invoke-WinRtOperation($Operation,[type]$ResultType,[int]$TimeoutMs=17000) {
+    $methods=@([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.IsGenericMethodDefinition -and $_.GetParameters().Count -eq 1 })
+    if($methods.Count -eq 0){throw 'WinRT AsTask<T> method is unavailable in this PowerShell runtime'}
+    $m=$methods[0].MakeGenericMethod([type[]]@($ResultType))
+    $task=$m.Invoke($null,[object[]]@($Operation))
+    if(-not $task.Wait($TimeoutMs)) { throw 'Timed out while waiting for Windows location permissions/coordinates' }
+    if($task.IsFaulted){ throw [string]$task.Exception }
+    return $task.Result
+}
+function Get-WindowsLocation {
+    # No BSSID harvesting. Windows itself selects GPS/Wi-Fi/cellular/IP sources.
+    $info=[ordered]@{
+        status='NOT_REQUESTED';latitude=$null;longitude=$null;accuracy_m=$null
+        source='Windows Location Service';approximate_address=$null;street=$null
+        house_number=$null;postcode=$null;city=$null;attribution=$null
+        note='One-time Windows Location fix; not proof of address/GPS. Not shared via Telegram by default.'
+    }
+    if(-not $EnableDeviceLocation){return $info}
+    Write-Host 'Location request: Windows Location Service. Exact coordinates may be stored in LOCAL JSON.' -ForegroundColor Yellow
+    $answer=Read-Host 'Allow one-time device location request? Type YES / Разрешить геолокацию? Введите YES'
+    if($answer -cne 'YES'){$info.status='DECLINED_BY_USER';return $info}
+    try {
+        Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
+        $geolocatorType=[Windows.Devices.Geolocation.Geolocator, Windows.Devices.Geolocation, ContentType = WindowsRuntime]
+        $positionType=[Windows.Devices.Geolocation.Geoposition, Windows.Devices.Geolocation, ContentType = WindowsRuntime]
+        $accessType=[Windows.Devices.Geolocation.GeolocationAccessStatus, Windows.Devices.Geolocation, ContentType = WindowsRuntime]
+        $permissionOp=$geolocatorType::RequestAccessAsync()
+        $permission=Invoke-WinRtOperation $permissionOp $accessType 20000
+        if([string]$permission -ne 'Allowed'){
+            $info.status='PERMISSION_'+([string]$permission).ToUpperInvariant()
+            $info.note='Enable Windows Settings > Privacy & security > Location; permit desktop applications.'
+            return $info
+        }
+        $locator=New-Object Windows.Devices.Geolocation.Geolocator
+        $locator.DesiredAccuracy=[Windows.Devices.Geolocation.PositionAccuracy]::High
+        $fixOp=$locator.GetGeopositionAsync()
+        $position=Invoke-WinRtOperation $fixOp $positionType 65000
+        $coordinate=$position.Coordinate
+        $info.latitude=[math]::Round([double]$coordinate.Point.Position.Latitude,6)
+        $info.longitude=[math]::Round([double]$coordinate.Point.Position.Longitude,6)
+        $info.accuracy_m=[math]::Round([double]$coordinate.Accuracy,0)
+        $info.status='OK'
+    } catch {
+        $info.status='UNAVAILABLE'
+        $info.note='Windows location unavailable: '+$_.Exception.Message+'. Check location permissions, desktop app access, foreground UI/STA, Wi-Fi/GPS availability.'
+        return $info
+    }
+    if($ReverseGeocode -and $info.status -eq 'OK') {
+        Write-Host 'Reverse geocoding would send coordinates to OpenStreetMap Nominatim (external service).' -ForegroundColor Yellow
+        $answer2=Read-Host 'Send coordinates for approximate street lookup? Type YES / Отправить координаты картосервису? YES'
+        if($answer2 -ceq 'YES') {
+            try {
+                $lat=$info.latitude.ToString([Globalization.CultureInfo]::InvariantCulture)
+                $lon=$info.longitude.ToString([Globalization.CultureInfo]::InvariantCulture)
+                $url="https://nominatim.openstreetmap.org/reverse?lat=$lat&lon=$lon&format=jsonv2&addressdetails=1&zoom=18"
+                $headers=@{'User-Agent'='NetworkSecurityAuditor-Personal/4.0 (one-shot opt-in reverse geocoding)';'Accept-Language'='ru,en'}
+                $reverse=Invoke-RestMethod -Uri $url -Headers $headers -TimeoutSec 16 -ErrorAction Stop
+                if($reverse){
+                    $info.approximate_address=[string]$reverse.display_name
+                    $info.street=if($reverse.address.road){[string]$reverse.address.road}else{$null}
+                    $info.house_number=if($reverse.address.house_number){[string]$reverse.address.house_number}else{$null}
+                    $info.postcode=if($reverse.address.postcode){[string]$reverse.address.postcode}else{$null}
+                    $info.city=if($reverse.address.city){[string]$reverse.address.city}elseif($reverse.address.town){[string]$reverse.address.town}else{$null}
+                    $info.attribution='(c) OpenStreetMap contributors / Nominatim'
+                    $info.note='Reverse geocoding returns a nearby map address, NOT a verified residence.'
+                }
+            } catch {$info.note+=' Reverse lookup failed: '+$_.Exception.Message}
+        }
+    }
+    return $info
+}
+function New-AuditPng([string]$FilePath,$Lines,[int]$Score,[string]$Grade) {
+    # This intentionally renders a reporting card, NOT the Windows desktop/screen.
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+    $width=1360
+    $expanded=New-Object 'System.Collections.Generic.List[object]'
+    foreach($entry in @($Lines)) {
+        $t=[string]$entry.text
+        $kind=[string]$entry.kind
+        # Render image-safe fixed width lines. Long entries wrap by whitespace.
+        $limit=if($kind -eq 'section'){69}else{76}
+        $remaining=$t
+        if([string]::IsNullOrEmpty($remaining)){$expanded.Add([pscustomobject]@{text=' ';kind=$kind});continue}
+        while($remaining.Length -gt $limit){
+            $cut=$remaining.LastIndexOf(' ',[math]::Min($remaining.Length-1,$limit))
+            if($cut -lt 20){$cut=$limit}
+            $expanded.Add([pscustomobject]@{text=$remaining.Substring(0,$cut).Trim();kind=$kind})
+            $remaining=$remaining.Substring($cut).TrimStart()
+        }
+        if($remaining.Length -gt 0){$expanded.Add([pscustomobject]@{text=$remaining;kind=$kind})}
+    }
+    $height=320
+    foreach($line in $expanded){$height += $(if($line.kind -eq 'section'){72}elseif($line.kind -eq 'divider'){20}else{43})}
+    $height=[math]::Min(12000,[math]::Max(1150,$height+95))
+    $bmp=New-Object System.Drawing.Bitmap($width,$height)
+    $g=[System.Drawing.Graphics]::FromImage($bmp)
+    $fontHead=$null;$fontSmall=$null;$fontTitle=$null;$fontScore=$null;$bgBrush=$null;$whiteBrush=$null;$mutedBrush=$null;$accentBrush=$null;$linePen=$null
+    try {
+        $g.SmoothingMode=[System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.TextRenderingHint=[System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+        $bgBrush=[System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(12,19,34))
+        $whiteBrush=[System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(239,245,255))
+        $mutedBrush=[System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(182,199,221))
+        $accentBrush=[System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(97,221,209))
+        $linePen=[System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(43,62,84),2)
+        $fontHead=[System.Drawing.Font]::new('Segoe UI',30,[System.Drawing.FontStyle]::Bold)
+        $fontTitle=[System.Drawing.Font]::new('Segoe UI',23,[System.Drawing.FontStyle]::Bold)
+        $fontSmall=[System.Drawing.Font]::new('Segoe UI',20,[System.Drawing.FontStyle]::Regular)
+        $fontScore=[System.Drawing.Font]::new('Segoe UI',78,[System.Drawing.FontStyle]::Bold)
+        $g.FillRectangle($bgBrush,0,0,$width,$height)
+        $g.DrawString('NETWORK SECURITY AUDITOR  /  REPORT', $fontHead,$whiteBrush,76,65)
+        $g.DrawString(('{0}/100' -f $Score),$fontScore,$accentBrush,76,120)
+        $g.DrawString(('STATUS  '+$Grade),$fontTitle,$mutedBrush,475,177)
+        $g.DrawLine($linePen,76,293,$width-76,293)
+        $y=327
+        foreach($line in $expanded){
+            if($y -gt $height - 90){break}
+            switch ($line.kind){
+              'section' {
+                $g.DrawString($line.text,$fontTitle,$accentBrush,76,$y)
+                $y+=72;break
+              }
+              'divider' { $g.DrawLine($linePen,76,$y+8,$width-76,$y+8);$y+=20;break }
+              default { $g.DrawString($line.text,$fontSmall,$whiteBrush,87,$y);$y+=43;break }
+            }
+        }
+        $g.DrawString('Rule-based indicators / Эвристика, не пентест', $fontSmall,$mutedBrush,76,$height-67)
+        $bmp.Save($FilePath,[System.Drawing.Imaging.ImageFormat]::Png)
+    }finally{
+        if($fontHead){$fontHead.Dispose()};if($fontSmall){$fontSmall.Dispose()};if($fontTitle){$fontTitle.Dispose()};if($fontScore){$fontScore.Dispose()}
+        if($bgBrush){$bgBrush.Dispose()};if($whiteBrush){$whiteBrush.Dispose()};if($mutedBrush){$mutedBrush.Dispose()};if($accentBrush){$accentBrush.Dispose()};if($linePen){$linePen.Dispose()}
+        $g.Dispose();$bmp.Dispose()
+    }
+}
+function Send-TgPhoto([string]$Path) {
+    if(-not ($SendTelegram -and $SendReportImage) -or -not (Test-Path -LiteralPath $Path)){return}
+    $http=New-Object System.Net.Http.HttpClient
+    try {
+        foreach($chatId in (Tg-TargetIds)) {
+            $form=$null
+            try {
+                $form=New-Object System.Net.Http.MultipartFormDataContent
+                $form.Add(([System.Net.Http.StringContent]::new([string]$chatId)),'chat_id')
+                $form.Add(([System.Net.Http.StringContent]::new('Network Security Auditor | network security summary / Сводка безопасности')),'caption')
+                $content=[System.Net.Http.ByteArrayContent]::new([byte[]][IO.File]::ReadAllBytes($Path))
+                $content.Headers.ContentType=[System.Net.Http.Headers.MediaTypeHeaderValue]::new('image/png')
+                $form.Add($content,'photo',[IO.Path]::GetFileName($Path))
+                $response=$http.PostAsync("https://api.telegram.org/bot${TelegramBotToken}/sendPhoto",$form).GetAwaiter().GetResult()
+                $response.EnsureSuccessStatusCode() | Out-Null
+                if(-not $script:sentTo.Contains([string]$chatId)){$script:sentTo.Add([string]$chatId)}
+            } catch {
+                $clean=$_.Exception.Message.Replace($TelegramBotToken,'[BOT_TOKEN_REDACTED]')
+                $script:telegramFailures.Add("Chat $chatId PNG: $clean")
+            } finally { if($null -ne $form){$form.Dispose()} }
+        }
+    }finally{$http.Dispose()}
+}
+
 if($TestTelegramOnly) {
     $SendTelegram=$true
     if([string]::IsNullOrWhiteSpace($TelegramBotToken)){
@@ -527,6 +689,10 @@ $net=@{
  gateway=$gateway;dns_configured=@($dnsList)
  all_adapters=@($allAdapters)
 }
+Write-Host '[1a/6] Optional device location (Windows permission + user confirmation)' -ForegroundColor Cyan
+$deviceLocation=Get-WindowsLocation
+$net.device_location=$deviceLocation
+Write-Host ('Device location: '+$deviceLocation.status+$(if($deviceLocation.status -eq 'OK'){' (accuracy ~'+$deviceLocation.accuracy_m+' m)'}else{''})) -ForegroundColor Yellow
 Write-Host '[1b/6] VPN / Proxy / Tor local state and Tor Project exit list' -ForegroundColor Cyan
 $vpnDiagnostics=Get-VpnStatus $allAdapters $adapter $intel
 $proxyDiagnostics=Get-ProxyStatus
@@ -671,9 +837,30 @@ $assessment=[ordered]@{
 $assessment.local_summary_ru += (' VPN: '+(Status-Text $vpnDiagnostics.status)+'; Proxy: '+(Status-Text $proxyDiagnostics.status)+'; Tor: '+(Status-Text $torDiagnostics.status)+'. Ledger: '+(Status-Text $walletReport.ledger.status)+'; Trezor: '+(Status-Text $walletReport.trezor.status)+'.')
 $assessment.local_summary_en += (' VPN: '+$vpnDiagnostics.status+'; Proxy: '+$proxyDiagnostics.status+'; Tor: '+$torDiagnostics.status+'. Ledger: '+$walletReport.ledger.status+'; Trezor: '+$walletReport.trezor.status+'.')
 
-$report=[ordered]@{schema='network-audit-v3';generated_at=(Get-Date).ToString('o');network=$net;leak_checks=$leak;windows_security=$windows;assessment=$assessment;collection_errors=$errorsList.ToArray()}
+$telegramLocationPermission=$false
+if($SharePreciseLocationInTelegram -and $deviceLocation.status -eq 'OK' -and $SendTelegram) {
+    Write-Host ('WARNING: precise device location will be sent to '+(Tg-TargetIds -join ', ')) -ForegroundColor Yellow
+    $confirmShare=Read-Host 'Share exact GPS/Wi-Fi coordinates and approximate street via Telegram? Type SHARE / Отправить точные координаты? SHARE'
+    if($confirmShare -ceq 'SHARE'){$telegramLocationPermission=$true}
+}
+$report=[ordered]@{schema='network-audit-v4';generated_at=(Get-Date).ToString('o');network=$net;leak_checks=$leak;windows_security=$windows;assessment=$assessment;collection_errors=$errorsList.ToArray()}
 $jsonPath=Join-Path $OutputDir ("network_audit_${stamp}.json")
 ($report | ConvertTo-Json -Depth 16) | Set-Content -Path $jsonPath -Encoding UTF8
+# A separate attachment is redacted by default. Local JSON can contain precise location.
+$jsonTelegramPath=$jsonPath
+if($deviceLocation.status -eq 'OK' -and -not $telegramLocationPermission) {
+    $jsonTelegramPath=Join-Path $OutputDir ("network_audit_${stamp}_telegram_redacted.json")
+    $safeCopy=($report | ConvertTo-Json -Depth 16 | ConvertFrom-Json)
+    $safeCopy.network.device_location.latitude=$null
+    $safeCopy.network.device_location.longitude=$null
+    $safeCopy.network.device_location.street=$null
+    $safeCopy.network.device_location.house_number=$null
+    $safeCopy.network.device_location.postcode=$null
+    $safeCopy.network.device_location.city=$null
+    $safeCopy.network.device_location.approximate_address=$null
+    $safeCopy.network.device_location.note='Precise location was withheld from Telegram; full details remain in local JSON.'
+    ($safeCopy | ConvertTo-Json -Depth 16) | Set-Content -Path $jsonTelegramPath -Encoding UTF8
+}
 
 # OpenAI / external AI review deliberately removed by request.
 # Every report conclusion comes from deterministic rules and evidence.
@@ -694,6 +881,9 @@ Country: $(OneLine $net.location.country_code) — $(OneLine $net.location.count
 Region: $(OneLine $net.location.region)
 City: $(OneLine $net.location.city)
 Street / House: unresolvable from IP
+Device location service: $($deviceLocation.status)
+Device location accuracy: $(if($deviceLocation.status -eq 'OK'){'~'+$deviceLocation.accuracy_m+' m'}else{'N/A'})
+$(if($telegramLocationPermission){'Device coordinates: '+$deviceLocation.latitude+', '+$deviceLocation.longitude+'`nDevice approximate street: '+(OneLine $deviceLocation.approximate_address 'not determined')+'`nMap data: '+(OneLine $deviceLocation.attribution 'N/A')}else{'Precise device position: LOCAL ONLY / НЕ ПЕРЕДАЕТСЯ'})
 Postal (approx.): $(OneLine $net.location.postal)
 Time zone: $(OneLine $net.location.timezone)
 ISP: $(OneLine $isp)
@@ -768,6 +958,33 @@ $($assessment.local_summary_ru)
 🇬🇧 SUMMARY
 $($assessment.local_summary_en)
 "@
+$pngPath=Join-Path $OutputDir ("network_audit_${stamp}.png")
+if($SendReportImage) {
+    $pngRows=@(
+      [pscustomobject]@{kind='section';text='PUBLIC NETWORK / ВНЕШНЯЯ СЕТЬ'},
+      [pscustomobject]@{kind='row';text=('IPv4: '+(OneLine $publicV4)+'  |  IPv6: '+(OneLine $publicV6 'N/A'))},
+      [pscustomobject]@{kind='row';text=('Location (IP-based): '+(OneLine $net.location.city)+', '+(OneLine $net.location.region)+', '+(OneLine $net.location.country))},
+      [pscustomobject]@{kind='row';text=('ISP: '+(OneLine $isp)+'  |  ASN: '+(OneLine $asn))},
+      [pscustomobject]@{kind='section';text='PRIVACY / ПРИВАТНОСТЬ'},
+      [pscustomobject]@{kind='row';text=('VPN: '+$vpnDiagnostics.status+'   Proxy: '+$proxyDiagnostics.status+'   Tor: '+$torDiagnostics.status)},
+      [pscustomobject]@{kind='row';text=('DNS: '+$dnsLeak.status+'   Browser DNS: '+$browserDns.status+'   WebRTC: '+$webrtc.status)},
+      [pscustomobject]@{kind='section';text='LOCAL NETWORK / СЕТЬ'},
+      [pscustomobject]@{kind='row';text=('Adapter: '+(OneLine $net.active_adapter)+'  |  Wi-Fi: '+(OneLine $wifi.signal_percent 'N/A')+'%')},
+      [pscustomobject]@{kind='row';text=('Gateway: '+$(if($IncludeLocalDetails){$gateway}else{'hidden'})+'   Ping: '+(OneLine $pingWan.avg_ms 'N/A')+' ms   Loss: '+$pingWan.loss_percent+'%')},
+      [pscustomobject]@{kind='section';text='SECURITY / ЗАЩИТА WINDOWS'},
+      [pscustomobject]@{kind='row';text=('Secure Boot: '+(OneLine $secureBoot 'unknown')+'   BitLocker: '+$(if($systemVolume){$systemVolume.ProtectionStatus}else{'unknown'}))},
+      [pscustomobject]@{kind='row';text=('Defender: '+$(if($defender){$defender.RealTimeProtectionEnabled}else{'unknown'}))},
+      [pscustomobject]@{kind='row';text=('Ledger: '+$walletReport.ledger.status+'   Trezor: '+$walletReport.trezor.status)},
+      [pscustomobject]@{kind='section';text='WINDOWS LOCATION / ГЕОЛОКАЦИЯ'},
+      [pscustomobject]@{kind='row';text=('Status: '+$deviceLocation.status+' | Accuracy: '+$(if($deviceLocation.status -eq 'OK'){'~'+$deviceLocation.accuracy_m+' m'}else{'N/A'}))},
+      [pscustomobject]@{kind='row';text=$(if($telegramLocationPermission){'Coordinates: '+$deviceLocation.latitude+', '+$deviceLocation.longitude}else{'Exact coordinates: LOCAL ONLY / НЕ ПЕРЕДАЮТСЯ'})},
+      [pscustomobject]@{kind='row';text=$(if($telegramLocationPermission){'Approx. address: '+(OneLine $deviceLocation.approximate_address 'not available')}else{'Street/house: not included in Telegram'})},
+      [pscustomobject]@{kind='section';text='ИТОГ / SUMMARY'},
+      [pscustomobject]@{kind='row';text=$assessment.local_summary_ru},
+      [pscustomobject]@{kind='row';text=$assessment.local_summary_en}
+    )
+    try { New-AuditPng $pngPath $pngRows $score $tier }catch{$script:errorsList.Add('PNG report: '+$_.Exception.Message);Write-Warning ('PNG creation failed: '+$_.Exception.Message)}
+}
 if($SendTelegram) {
     if([string]::IsNullOrWhiteSpace($TelegramBotToken) -or $TelegramBotToken -eq 'PASTE_NEW_BOT_TOKEN_HERE') {
         Write-Warning 'Telegram skipped: put a NEW token in TG_BOT_TOKEN (PowerShell env var). Current leaked token should be revoked.'
@@ -785,7 +1002,8 @@ if($SendTelegram) {
         if($issues.Count -gt 0){Send-TgLong 'Network Audit • 3/3 • Findings' ($issues -join "`n`n")}
         Send-TgLong 'Audit method / Метод проверки' 'RULE-BASED LOCAL ASSESSMENT. No AI API is called. Checks are not penetration testing.
 ОЦЕНКА ПО ЛОКАЛЬНЫМ ПРАВИЛАМ. Вызовов ИИ нет. Проверки не заменяют пентест.'
-        Send-TgDocument $jsonPath
+        Send-TgDocument $jsonTelegramPath
+        Send-TgPhoto $pngPath
         if($sentTo.Count -gt 0){Write-Host ('Telegram delivered to chat ID(s): '+($sentTo.ToArray() -join ', ')) -ForegroundColor Green}
         if($telegramFailures.Count -gt 0){
             foreach($failure in $telegramFailures.ToArray()){Write-Warning $failure}
@@ -798,6 +1016,7 @@ $summaryPath=Join-Path $OutputDir ("network_audit_${stamp}.txt")
 (@($overview,$securityText,('FINDINGS / НАХОДКИ' + "`n" + ((@($findings | ForEach-Object {$_.ru+' / '+$_.en}) -join "`n"))),('ASSESSMENT METHOD' + "`n" + 'Local deterministic rules only; no AI API used')) -join "`n`n") | Set-Content -Path $summaryPath -Encoding UTF8
 Write-Host "JSON: $jsonPath" -ForegroundColor Green
 Write-Host "TXT:  $summaryPath" -ForegroundColor Green
+if(Test-Path $pngPath){Write-Host "PNG:  $pngPath" -ForegroundColor Green}
 if($telegramFailures.Count -gt 0){
     ('TELEGRAM SEND ERRORS' + "`n" + ($telegramFailures.ToArray() -join "`n")) | Add-Content -Path $summaryPath -Encoding UTF8
 }
