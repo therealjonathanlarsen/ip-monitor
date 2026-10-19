@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-Network Security Auditor - local, read-only diagnostics.
+Network Security Auditor v3 - local, read-only diagnostics.
 Windows 10/11, PowerShell 5.1+. No credential extraction, no remote subnet scan.
 External services: ipify, ipwho.is, api.ipapi.is (optional key), bash.ws,
 Google/Cloudflare STUN servers, Telegram Bot API (explicitly configured).
@@ -223,6 +223,186 @@ function Is-PublicV4([string]$Address) {
     if($octets[0] -eq 203 -and $octets[1] -eq 0 -and $octets[2] -eq 113){return $false}
     return $true
 }
+
+function Get-IntelBoolean($Object,[string]$Field) {
+    # A missing field in anonymous IP lookup is UNKNOWN, never false.
+    if($null -eq $Object){return $null}
+    $prop=$Object.PSObject.Properties[$Field]
+    if($null -eq $prop -or $null -eq $prop.Value){return $null}
+    $v=$prop.Value
+    if($v -is [bool]){return $v}
+    if([string]$v -match '^(?i:false|0|no)$'){return $false}
+    if([string]$v -match '^(?i:true|1|yes)$'){return $true}
+    # The provider documents some truthy VPN flags that are not Boolean.
+    return $true
+}
+function Get-VpnStatus($AllAdapters,$CurrentAdapter,$IpIntel) {
+    $detected=New-Object 'System.Collections.Generic.List[string]'
+    $checked=$false
+    $connectionNames=New-Object 'System.Collections.Generic.List[string]'
+    foreach($allUser in @($false,$true)) {
+        try {
+            $c=if($allUser){@(Get-VpnConnection -AllUserConnection -ErrorAction Stop)}else{@(Get-VpnConnection -ErrorAction Stop)}
+            $checked=$true
+            foreach($entry in $c) {
+                if([string]$entry.ConnectionStatus -eq 'Connected') {
+                    $label=OneLine $entry.Name 'Unnamed Windows VPN'
+                    if(-not $connectionNames.Contains($label)){$connectionNames.Add($label)}
+                    $hint='Windows VPN active: '+$label
+                    if(-not $detected.Contains($hint)){$detected.Add($hint)}
+                }
+            }
+        }catch { }
+    }
+    $adapterChecked=$null -ne $AllAdapters
+    foreach($nic in @($AllAdapters)) {
+        if($null -eq $nic){continue}
+        $caption=([string]$nic.Name+' '+[string]$nic.InterfaceDescription)
+        if([string]$nic.Status -ne 'Up'){continue}
+        if($caption -match '(?i)wireguard|wintun|openvpn|tap.windows|nordlynx|tailscale|zerotier|proton.?vpn|surfshark|windscribe|softether|anyconnect|globalprotect|fortinet|forticlient|cloudflare.?warp|adguard.?vpn|amnezia|pritunl|outline.?vpn|mullvad|ivpn|expressvpn|cyberghost|vpn.?tunnel') {
+            $hint='Active VPN-like adapter: '+(OneLine $nic.Name)
+            if(-not $detected.Contains($hint)){$detected.Add($hint)}
+        }
+    }
+    $exitFlag=Get-IntelBoolean $IpIntel 'is_vpn'
+    $status=if($detected.Count -gt 0 -or $exitFlag -eq $true){'ON'}elseif($checked -or $adapterChecked){'NOT_DETECTED'}else{'UNKNOWN'}
+    return [ordered]@{
+        status=$status
+        local_tunnel=if($detected.Count -gt 0){'DETECTED'}elseif($checked -or $adapterChecked){'NOT_DETECTED'}else{'UNKNOWN'}
+        active_connections=@($connectionNames.ToArray())
+        evidence=@($detected.ToArray())
+        external_exit_ip=if($null -eq $exitFlag){'UNKNOWN (IP intelligence key required)'}elseif($exitFlag){'VPN EXIT FLAGGED'}else{'NOT FLAGGED'}
+        note='Active Windows VPN interfaces and Windows VPN profiles are examined; proxy/browser-only VPNs or stealth tunnels can be missed. An exit-IP flag is not proof that this PC has a VPN client.'
+    }
+}
+function Get-ProxyStatus {
+    $signals=New-Object 'System.Collections.Generic.List[string]'
+    $possible=New-Object 'System.Collections.Generic.List[string]'
+    $checked=$false
+    try {
+        $r=Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction Stop
+        $checked=$true
+        if([int]$r.ProxyEnable -eq 1 -and -not [string]::IsNullOrWhiteSpace([string]$r.ProxyServer)) {
+            $signals.Add('Windows user proxy enabled (WinINET)')
+        }
+        if(-not [string]::IsNullOrWhiteSpace([string]$r.AutoConfigURL)) {
+            $possible.Add('PAC script configured (proxy use depends on its rules)')
+        }
+        if([int]$r.AutoDetect -eq 1){$possible.Add('WPAD / automatically detect proxy settings enabled')}
+    }catch{}
+    try {
+        $out=((& netsh winhttp show proxy 2>$null) | Out-String)
+        if(-not [string]::IsNullOrWhiteSpace($out)){$checked=$true}
+        # netsh display is localized. Only confidently identify explicit server lines.
+        if($out -match '(?im)^\s*(?:Proxy Server\(s\)|Proxy Server|Прокси-сервер|Прокси сервер)\s*:\s*(\S.+)$') {
+            $server=$Matches[1].Trim()
+            if($server -notmatch '(?i)\b(direct|нет|отсутствует|none)\b'){$signals.Add('WinHTTP proxy server configured')}
+        }
+    }catch{}
+    foreach($key in @('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy')) {
+        $value=[Environment]::GetEnvironmentVariable($key,'Process')
+        if(-not [string]::IsNullOrWhiteSpace($value)) {
+            $checked=$true
+            $label='Proxy environment variable: '+$key
+            if(-not $signals.Contains($label)){$signals.Add($label)}
+        }
+    }
+    $status=if($signals.Count -gt 0){'ON'}elseif($possible.Count -gt 0){'AUTO_CONFIGURED'}elseif($checked){'NOT_DETECTED'}else{'UNKNOWN'}
+    return [ordered]@{
+        status=$status;evidence=@($signals.ToArray());possible=@($possible.ToArray())
+        note='Proxy is detected from WinINET, WinHTTP and process environment. PAC/WPAD may be direct or proxied; per-browser extensions, app-specific SOCKS settings and network gateways are not covered.'
+    }
+}
+function Get-TorStatus([string]$PublicIPv4,$IpIntel) {
+    $processStatus='UNKNOWN';$localPorts='UNKNOWN'
+    try {
+        $torProcesses=@(Get-Process -Name 'tor','lyrebird','obfs4proxy' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ProcessName -Unique)
+        $processStatus=if($torProcesses.Count -gt 0){'DETECTED'}else{'NOT_DETECTED'}
+    } catch {}
+    try {
+        $torSocks=@(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object {$_.LocalPort -in @(9050,9150) -and $_.LocalAddress -in @('127.0.0.1','::1','0.0.0.0','::')})
+        $localPorts=if($torSocks.Count -gt 0){'POSSIBLE_TOR_SOCKS'}else{'NOT_DETECTED'}
+    }catch{}
+    $exitListStatus='UNKNOWN';$exitListNotes='Not checked'
+    if(-not [string]::IsNullOrWhiteSpace($PublicIPv4) -and (Is-PublicV4 $PublicIPv4)) {
+        try {
+            $txt=Get-TextUrl 'https://check.torproject.org/torbulkexitlist'
+            $ips=@($txt -split '[\r\n]+' | Where-Object {$_ -match '^\d{1,3}(?:\.\d{1,3}){3}$'})
+            if($ips.Count -gt 100) {
+                $exitListStatus=if($PublicIPv4 -in $ips){'TOR_EXIT_FLAGGED'}else{'NOT_FLAGGED'}
+                $exitListNotes='Tor Project bulk exit list; checks only the observed HTTP public IPv4'
+            }else{$exitListNotes='Tor exit list returned too few addresses for a reliable check'}
+        }catch{$exitListNotes='Tor exit list unavailable: '+$_.Exception.Message}
+    }
+    $vendorExit=Get-IntelBoolean $IpIntel 'is_tor'
+    $status=if($processStatus -eq 'DETECTED' -or $exitListStatus -eq 'TOR_EXIT_FLAGGED' -or $vendorExit -eq $true) {'ON'}
+            elseif($localPorts -eq 'POSSIBLE_TOR_SOCKS') {'POSSIBLE'}
+            elseif($processStatus -eq 'NOT_DETECTED') {'NOT_DETECTED'}else{'UNKNOWN'}
+    return [ordered]@{
+        status=$status;tor_process=$processStatus;socks_ports=$localPorts
+        exit_ip_tor_project=$exitListStatus
+        exit_ip_ip_intelligence=if($null -eq $vendorExit){'UNKNOWN'}elseif($vendorExit){'TOR_EXIT_FLAGGED'}else{'NOT_FLAGGED'}
+        list_note=$exitListNotes
+        note='Tor can be used in an isolated browser or through a remote proxy without changing the system public IP; no local evidence is not proof of absence. A Tor-exit IP alone does not prove a local Tor client is running.'
+    }
+}
+function Get-HardwareWalletStatus {
+    $inventory=@();$source='Get-PnpDevice -PresentOnly';$valid=$false;$fallback=$false
+    try {
+        $inventory=@(Get-PnpDevice -PresentOnly -ErrorAction Stop)
+        $valid=$true
+    }catch {
+        try {
+            # Win32_PnPEntity sometimes includes cached/ghost devices. Fallback is a weak signal only.
+            $inventory=@(Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction Stop | Where-Object {$_.ConfigManagerErrorCode -eq 0})
+            $source='Win32_PnPEntity (fallback; connection may be cached)';$valid=$true;$fallback=$true
+        }catch{$source='Device enumeration unavailable'}
+    }
+    $out=@{}
+    foreach($brand in @('Ledger','Trezor')) {
+        $hits=New-Object 'System.Collections.Generic.List[object]'
+        $seen=New-Object 'System.Collections.Generic.HashSet[string]'
+        if($valid){
+            foreach($dev in $inventory){
+                $id=if($dev.PSObject.Properties['InstanceId']){[string]$dev.InstanceId}else{[string]$dev.PNPDeviceID}
+                $name=if($dev.PSObject.Properties['FriendlyName']){[string]$dev.FriendlyName}else{[string]$dev.Name}
+                $mfg=if($dev.PSObject.Properties['Manufacturer']){[string]$dev.Manufacturer}else{''}
+                $pnp=$id.ToUpperInvariant()
+                $byId=if($brand -eq 'Ledger'){$pnp -match 'VID_2C97'}else{($pnp -match 'VID_1209&PID_53C[0-3]') -or ($pnp -match 'VID_534C')}
+                $byName=(($name+' '+$mfg) -match ('(?i)\b'+$brand+'\b'))
+                if(-not ($byId -or $byName)){continue}
+                $vidpid=if($id -match '(?i)(VID_[0-9A-F]{4}&PID_[0-9A-F]{4})'){$Matches[1].ToUpperInvariant()}else{'Not supplied'}
+                $label=OneLine $name 'USB/HID wallet interface'
+                $status=OneLine $dev.Status 'unknown'
+                $dedup=$label+'|'+$vidpid+'|'+$status
+                if($seen.Add($dedup)){
+                    $hits.Add([ordered]@{name=$label;vid_pid=$vidpid;driver_status=$status;matched_by=if($byId){'USB vendor/product ID'}else{'PnP device name'}})
+                }
+            }
+        }
+        $out[$brand.ToLowerInvariant()]=[ordered]@{
+            status=if(-not $valid){'UNKNOWN'}elseif($hits.Count -eq 0){'NOT_DETECTED'}elseif($fallback){'POSSIBLE'}else{'DETECTED'}
+            interfaces_detected=$hits.Count
+            devices=@($hits.ToArray())
+            note=if($fallback){'Fallback Windows inventory can include cached devices; not confirmed connected'}else{'Present USB/HID interfaces, not guaranteed count of physical wallets; device identification is heuristic'}
+        }
+    }
+    return [ordered]@{
+        source=$source;ledger=$out['ledger'];trezor=$out['trezor']
+        privacy='No hardware wallet keys, serial numbers, addresses, software data, secrets or seed phrases are collected'
+    }
+}
+function Status-Text([string]$Status) {
+    switch ($Status) {
+        'ON' {'🟢 ВКЛЮЧЁН / ON';break}
+        'DETECTED' {'🟢 ОБНАРУЖЕН / DETECTED';break}
+        'POSSIBLE' {'🟠 ВОЗМОЖНО / POSSIBLE';break}
+        'AUTO_CONFIGURED' {'🟠 АВТОНАСТРОЙКА / AUTO';break}
+        'NOT_DETECTED' {'⚪ НЕ ОБНАРУЖЕН / NOT DETECTED';break}
+        default {'⚪ НЕИЗВЕСТНО / UNKNOWN'}
+    }
+}
+
 function Tg-TargetIds {
     return @($TelegramChatIds -split '[,;\s]+' | Where-Object { $_ -match '^-?\d+$' } | Select-Object -Unique)
 }
@@ -336,10 +516,10 @@ $net=@{
   accuracy='approximate, not a verified physical address'
  }
  isp=$isp;asn=$asn;registered_company=$company
- vpn=if($IpIntelApiKey -and $intel){$intel.is_vpn}else{$null}
- proxy=if($IpIntelApiKey -and $intel){$intel.is_proxy}else{$null}
- tor=if($IpIntelApiKey -and $intel){$intel.is_tor}else{$null}
- datacenter=if($IpIntelApiKey -and $intel){$intel.is_datacenter}else{$null}
+ vpn=Get-IntelBoolean $intel 'is_vpn'
+ proxy=Get-IntelBoolean $intel 'is_proxy'
+ tor=Get-IntelBoolean $intel 'is_tor'
+ datacenter=Get-IntelBoolean $intel 'is_datacenter' 
  active_adapter=if($adapter){$adapter.Name}else{$null}
  adapter_description=if($adapter){$adapter.InterfaceDescription}else{$null}
  link_speed=if($adapter){[string]$adapter.LinkSpeed}else{$null}
@@ -347,6 +527,16 @@ $net=@{
  gateway=$gateway;dns_configured=@($dnsList)
  all_adapters=@($allAdapters)
 }
+Write-Host '[1b/6] VPN / Proxy / Tor local state and Tor Project exit list' -ForegroundColor Cyan
+$vpnDiagnostics=Get-VpnStatus $allAdapters $adapter $intel
+$proxyDiagnostics=Get-ProxyStatus
+$torDiagnostics=Get-TorStatus $publicV4 $intel
+# An IP reputation flag describes the IP, not necessarily an enabled local proxy.
+$proxyIntelStatus=if($null -eq $net.proxy){'UNKNOWN (IP intelligence key required)'}elseif($net.proxy){'PUBLIC PROXY EXIT FLAGGED'}else{'NOT FLAGGED'}
+$net.vpn_diagnostics=$vpnDiagnostics
+$net.proxy_diagnostics=$proxyDiagnostics
+$net.proxy_exit_ip_intelligence=$proxyIntelStatus
+$net.tor_diagnostics=$torDiagnostics
 $os=Safe { Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty Caption } 'Operating system'
 
 Write-Host '[2/6] Wi-Fi, latency, router reachability and heuristics' -ForegroundColor Cyan
@@ -416,17 +606,19 @@ $winUpdate=Safe { Get-HotFix | Sort-Object InstalledOn -Descending | Select-Obje
 $listenerRows=Safe { @(Get-NetTCPConnection -State Listen | Where-Object {$_.LocalAddress -in @('0.0.0.0','::')} | Select-Object LocalAddress,LocalPort,OwningProcess -Unique) } 'Local listeners'
 $sensitivePorts=@(21,23,135,139,445,3389,5900,5985,5986,8080)
 $exposedListeners=@($listenerRows | Where-Object {$_.LocalPort -in $sensitivePorts})
-$wallets=Safe {
-    @(Get-PnpDevice -PresentOnly | Where-Object {
-        ($_.FriendlyName -match '(?i)\b(ledger|trezor)\b') -or ($_.InstanceId -match '(?i)(VID_2C97|VID_1209&PID_53C[0-3]|VID_534C)')
-    } | Select-Object @{n='name';e={$_.FriendlyName}},Status,Class)
-} 'Ledger/Trezor present hardware check'
-if($null -eq $wallets){$wallets=@()}
+$walletReport=Get-HardwareWalletStatus
+Write-Host ('VPN:    '+(Status-Text $vpnDiagnostics.status)) -ForegroundColor Yellow
+Write-Host ('Proxy:  '+(Status-Text $proxyDiagnostics.status)) -ForegroundColor Yellow
+Write-Host ('Tor:    '+(Status-Text $torDiagnostics.status)) -ForegroundColor Yellow
+Write-Host ('Ledger: '+(Status-Text $walletReport.ledger.status)) -ForegroundColor Yellow
+Write-Host ('Trezor: '+(Status-Text $walletReport.trezor.status)) -ForegroundColor Yellow
+$wallets=@($walletReport.ledger.devices)+@($walletReport.trezor.devices)
 $windows=@{
  os=$os;firewall=@($firewall);secure_boot=$secureBoot;bitlocker=@($bitlocker)
  defender=$defender;latest_hotfix=$winUpdate
  inbound_listening_sensitive_ports=@($exposedListeners)
  ledger_trezor_attached=@($wallets)
+ hardware_wallets=$walletReport
  note='Wallet presence only; no wallet software, addresses, PINs, private keys or seed phrases read'
 }
 
@@ -459,7 +651,8 @@ if($ExpectedVpnPublicIPv4 -and $publicV4 -and $publicV4 -ne $ExpectedVpnPublicIP
 if($webrtcHostIPs.Count -gt 0){Add-Finding 'info' 'WebRTC показывает локальные IP внутри браузера; оцените настройки приватности' 'WebRTC exposes host IPs inside this browser; review privacy settings' 0}
 if($webrtc.status -ne 'finished' -or @($webrtc.candidates).Count -eq 0){Add-Finding 'unknown' 'Тест WebRTC не дал достаточно ICE-кандидатов для вывода' 'WebRTC did not provide enough ICE candidates for a conclusion' 0}
 if(-not $publicV4 -or -not $route){Add-Finding 'unknown' 'Нет подтверждённой IPv4-связности или маршрута по умолчанию' 'IPv4 connectivity/default route not confirmed' 0}
-if($null -eq $net.vpn){Add-Finding 'unknown' 'Статус VPN/Proxy/Tor по IP не проверен: необходим IPAPI_IS_KEY' 'IP VPN/Proxy/Tor intelligence unavailable without IPAPI_IS_KEY' 0}
+if($net.vpn -eq $null){Add-Finding 'unknown' 'Классификация публичного IP как VPN/Proxy/Tor недоступна без IPAPI_IS_KEY; локальные проверки выполнены отдельно' 'Public IP VPN/Proxy/Tor reputation unavailable without IPAPI_IS_KEY; local checks ran separately' 0}
+if($walletReport.ledger.status -eq 'UNKNOWN' -or $walletReport.trezor.status -eq 'UNKNOWN'){Add-Finding 'unknown' 'Не удалось получить достоверный список USB/PnP устройств Ledger/Trezor' 'Ledger/Trezor present-device inventory unavailable' 0}
 $score=100
 foreach($f in $findings){$score-=[int]$f.penalty}
 $score=[math]::Max(0,[math]::Min(100,$score))
@@ -475,7 +668,10 @@ $assessment=[ordered]@{
  local_summary_en="Score: $score/100 ($tier), confidence: $confidence. Scope: this PC, local gateway, external services. Penalized findings: $(@($findings.ToArray() | Where-Object {$_.penalty -gt 0}).Count). Unknown does NOT mean safe. Rule-based posture assessment, not a pentest."
 }
 
-$report=[ordered]@{schema='network-audit-v2';generated_at=(Get-Date).ToString('o');network=$net;leak_checks=$leak;windows_security=$windows;assessment=$assessment;collection_errors=$errorsList.ToArray()}
+$assessment.local_summary_ru += (' VPN: '+(Status-Text $vpnDiagnostics.status)+'; Proxy: '+(Status-Text $proxyDiagnostics.status)+'; Tor: '+(Status-Text $torDiagnostics.status)+'. Ledger: '+(Status-Text $walletReport.ledger.status)+'; Trezor: '+(Status-Text $walletReport.trezor.status)+'.')
+$assessment.local_summary_en += (' VPN: '+$vpnDiagnostics.status+'; Proxy: '+$proxyDiagnostics.status+'; Tor: '+$torDiagnostics.status+'. Ledger: '+$walletReport.ledger.status+'; Trezor: '+$walletReport.trezor.status+'.')
+
+$report=[ordered]@{schema='network-audit-v3';generated_at=(Get-Date).ToString('o');network=$net;leak_checks=$leak;windows_security=$windows;assessment=$assessment;collection_errors=$errorsList.ToArray()}
 $jsonPath=Join-Path $OutputDir ("network_audit_${stamp}.json")
 ($report | ConvertTo-Json -Depth 16) | Set-Content -Path $jsonPath -Encoding UTF8
 
@@ -502,7 +698,23 @@ Postal (approx.): $(OneLine $net.location.postal)
 Time zone: $(OneLine $net.location.timezone)
 ISP: $(OneLine $isp)
 ASN: $(OneLine $asn)
-VPN / Proxy / Tor (IP intel): $(if($null -eq $net.vpn){'Unknown / requires IPAPI_IS_KEY'}else{"VPN=$($net.vpn), Proxy=$($net.proxy), Tor=$($net.tor)"})
+
+🔐 VPN / PROXY / TOR
+VPN: $(Status-Text $vpnDiagnostics.status)
+VPN (local tunnel): $($vpnDiagnostics.local_tunnel)
+VPN (public IP): $($vpnDiagnostics.external_exit_ip)
+VPN connection details: $(if($vpnDiagnostics.evidence.Count){$vpnDiagnostics.evidence -join '; '}else{'No active VPN profiles/adapters detected'})
+Proxy: $(Status-Text $proxyDiagnostics.status)
+Proxy (public IP): $proxyIntelStatus
+Proxy settings: $(if($proxyDiagnostics.evidence.Count){$proxyDiagnostics.evidence -join '; '}else{'No explicit proxy settings detected'})
+Proxy auto config: $(if($proxyDiagnostics.possible.Count){$proxyDiagnostics.possible -join '; '}else{'Not detected'})
+Tor: $(Status-Text $torDiagnostics.status)
+Tor process: $($torDiagnostics.tor_process)
+Tor SOCKS (9050/9150): $($torDiagnostics.socks_ports)
+Tor exit (official Tor list): $($torDiagnostics.exit_ip_tor_project)
+Tor exit (IP reputation): $($torDiagnostics.exit_ip_ip_intelligence)
+Tor check note: $($torDiagnostics.list_note)
+Note: NOT DETECTED != guaranteed absent; browser/application-specific tunnels need their own checks.
 
 📡 LOCAL NETWORK / ЛОКАЛЬНАЯ СЕТЬ
 Adapter: $(OneLine $net.active_adapter)
@@ -521,7 +733,16 @@ Windows Firewall: $(if($firewall){(@($firewall | ForEach-Object {"$($_.Name)=$($
 Secure Boot: $(if($null -eq $secureBoot){'Unknown'}else{$secureBoot})
 BitLocker OS volume: $(if($systemVolume){$systemVolume.ProtectionStatus}else{'Unknown'})
 Defender real-time: $(if($defender){$defender.RealTimeProtectionEnabled}else{'Unknown'})
-Ledger/Trezor devices: $(@($wallets).Count) detected (not proof of absence if 0)
+
+🔌 HARDWARE WALLETS / АППАРАТНЫЕ КОШЕЛЬКИ
+LEDGER: $(Status-Text $walletReport.ledger.status)
+Ledger detected USB/HID entries: $($walletReport.ledger.interfaces_detected)
+$(if($walletReport.ledger.devices.Count -gt 0){@($walletReport.ledger.devices | ForEach-Object {('• '+$_.name+' ['+$_.vid_pid+'] / PnP: '+$_.driver_status)}) -join "`n"}else{'Ledger details: no present matching interfaces or inventory unavailable'})
+TREZOR: $(Status-Text $walletReport.trezor.status)
+Trezor detected USB/HID entries: $($walletReport.trezor.interfaces_detected)
+$(if($walletReport.trezor.devices.Count -gt 0){@($walletReport.trezor.devices | ForEach-Object {('• '+$_.name+' ['+$_.vid_pid+'] / PnP: '+$_.driver_status)}) -join "`n"}else{'Trezor details: no present matching interfaces or inventory unavailable'})
+Hardware check source: $($walletReport.source)
+Hardware privacy: no serials, wallet addresses, seeds or keys collected.
 Sensitive listening ports: $(if(@($exposedListeners).Count){(@($exposedListeners | Select-Object -ExpandProperty LocalPort -Unique) -join ', ')}else{'none found'})
 Gateway port checks: $(if($CheckGatewayPorts){($gatewayPorts | ConvertTo-Json -Compress)}else{'not requested'})
 
@@ -558,8 +779,8 @@ if($SendTelegram) {
 }
 if($SendTelegram) {
     try {
-        Send-TgLong 'Network Audit • 1/3 • Network' $overview
-        Send-TgLong 'Network Audit • 2/3 • Security' $securityText
+        Send-TgLong 'Network Audit • 1/3 • Network + VPN' $overview
+        Send-TgLong 'Network Audit • 2/3 • Security + Hardware Wallets' $securityText
         $issues=@($findings | ForEach-Object {"[$($_.level)] RU: $($_.ru)`nEN: $($_.en)"})
         if($issues.Count -gt 0){Send-TgLong 'Network Audit • 3/3 • Findings' ($issues -join "`n`n")}
         Send-TgLong 'Audit method / Метод проверки' 'RULE-BASED LOCAL ASSESSMENT. No AI API is called. Checks are not penetration testing.
