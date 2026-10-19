@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-Network Security Auditor v6 - verified local screenshot + desktop overlay.
+Network Security Auditor v6.1 - one-time screenshot consent at startup.
 Windows 10/11, PowerShell 5.1+. No credential extraction, no remote subnet scan.
 External services: ipify, ipwho.is, api.ipapi.is (optional key), bash.ws,
 Google/Cloudflare STUN servers, Telegram Bot API (explicitly configured).
@@ -33,6 +33,34 @@ try { Add-Type -AssemblyName System.Net.Http -ErrorAction Stop } catch {}
 try { Add-Type -AssemblyName System.Drawing -ErrorAction Stop } catch {}
 try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop } catch {}
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+# One explicit approval at script start. Consent is per-run and never persisted.
+# No image is captured or transmitted if the user cancels here.
+if(-not $TestTelegramOnly -and ($SendReportImage -or $TestScreenshotOnly)) {
+    Write-Host ''
+    Write-Host '================== SCREENSHOT CONSENT ==================' -ForegroundColor Yellow
+    if($TestScreenshotOnly) {
+        Write-Host 'Do you agree to capture and save a screenshot of your visible desktop locally?' -ForegroundColor White
+        Write-Host 'Согласны сделать и сохранить локальный снимок экрана? В Telegram он НЕ отправляется.' -ForegroundColor White
+    } elseif($SendTelegram) {
+        Write-Host 'Do you agree to capture your visible desktop with an audit overlay and SHARE IT in Telegram?' -ForegroundColor White
+        Write-Host 'Согласны сделать скриншот рабочего стола с отчетом и ОТПРАВИТЬ его в Telegram?' -ForegroundColor White
+        Write-Host ('Telegram chat ID(s): '+$TelegramChatIds) -ForegroundColor Yellow
+    } else {
+        Write-Host 'Do you agree to capture your visible desktop and save the audit image locally?' -ForegroundColor White
+        Write-Host 'Согласны сделать скриншот рабочего стола и сохранить его только на этом ПК?' -ForegroundColor White
+    }
+    Write-Host 'The screenshot may contain open windows, messages, or confidential information.' -ForegroundColor DarkYellow
+    Write-Host 'На скриншоте могут быть видны открытые окна, переписки и личные данные.' -ForegroundColor DarkYellow
+    $screenshotApproval=Read-Host 'Press ENTER to agree and start / ENTER - согласие и запуск; Ctrl+C - выход'
+    if($null -eq $screenshotApproval -or $screenshotApproval.Length -ne 0) {
+        Write-Host 'Cancelled: no audit started, no screenshot captured / Отменено.' -ForegroundColor Yellow
+        return
+    }
+    Write-Host 'Screenshot consent accepted for this run / Согласие получено для этого запуска.' -ForegroundColor Green
+    Write-Host '========================================================' -ForegroundColor DarkGray
+    Write-Host ''
+}
 New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $errorsList = New-Object 'System.Collections.Generic.List[string]'
@@ -569,9 +597,8 @@ function New-AuditPng([string]$FilePath,$Lines,[int]$Score,[string]$Grade) {
         }
     }
 
-    # Screenshot is always opt-in. Never replace a failed capture with a fake screenshot.
-    $permission=Read-Host 'Capture YOUR VISIBLE desktop now? Type CAPTURE / Для снимка экрана введите CAPTURE'
-    if($permission -cne 'CAPTURE') { throw 'Screen capture cancelled; no screenshot created or sent.' }
+    # Explicit approval was collected at the beginning of this invocation.
+    # Never replace a failed capture with a fake screenshot.
 
     $bmp=$null; $g=$null
     $rawPath=[IO.Path]::Combine([IO.Path]::GetDirectoryName($FilePath),([IO.Path]::GetFileNameWithoutExtension($FilePath) + '_raw.png'))
@@ -681,10 +708,8 @@ function New-AuditPng([string]$FilePath,$Lines,[int]$Score,[string]$Grade) {
 }
 function Send-TgPhoto([string]$Path) {
     if(-not ($SendTelegram -and $SendReportImage) -or -not (Test-Path -LiteralPath $Path)){return}
-    Write-Host ('SCREENSHOT PREVIEW: '+$Path) -ForegroundColor Yellow
-    try { Start-Process -FilePath $Path -ErrorAction Stop | Out-Null } catch { Write-Warning ('Preview unavailable: '+$_.Exception.Message) }
-    $decision=Read-Host ('Send this VISIBLE-DESKTOP screenshot to Telegram chat IDs '+$TelegramChatIds+'? Type SEND / Отправить? Введите SEND')
-    if($decision -cne 'SEND') { Write-Host 'Screen image not sent to Telegram (you declined).' -ForegroundColor Yellow; return }
+    # Approval to share the screenshot was already given once at script start.
+    # No second prompt or preview delays the Telegram upload.
     $http=New-Object System.Net.Http.HttpClient
     try {
         foreach($chatId in (Tg-TargetIds)) {
