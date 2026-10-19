@@ -29,6 +29,8 @@ param(
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 try { Add-Type -AssemblyName System.Net.Http -ErrorAction Stop } catch {}
+try { Add-Type -AssemblyName System.Drawing -ErrorAction Stop } catch {}
+try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop } catch {}
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -539,66 +541,133 @@ function Get-WindowsLocation {
     return $info
 }
 function New-AuditPng([string]$FilePath,$Lines,[int]$Score,[string]$Grade) {
-    # This intentionally renders a reporting card, NOT the Windows desktop/screen.
+    # v5: real desktop screenshot + diagnostic overlay instead of standalone card.
     Add-Type -AssemblyName System.Drawing -ErrorAction Stop
-    $width=1360
-    $expanded=New-Object 'System.Collections.Generic.List[object]'
-    foreach($entry in @($Lines)) {
-        $t=[string]$entry.text
-        $kind=[string]$entry.kind
-        # Render image-safe fixed width lines. Long entries wrap by whitespace.
-        $limit=if($kind -eq 'section'){69}else{76}
-        $remaining=$t
-        if([string]::IsNullOrEmpty($remaining)){$expanded.Add([pscustomobject]@{text=' ';kind=$kind});continue}
-        while($remaining.Length -gt $limit){
-            $cut=$remaining.LastIndexOf(' ',[math]::Min($remaining.Length-1,$limit))
-            if($cut -lt 20){$cut=$limit}
-            $expanded.Add([pscustomobject]@{text=$remaining.Substring(0,$cut).Trim();kind=$kind})
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+
+    function _WrapOverlayText([string]$Text,[int]$Limit) {
+        $result=New-Object 'System.Collections.Generic.List[string]'
+        $remaining=[string]$Text
+        if([string]::IsNullOrWhiteSpace($remaining)) { $result.Add(' '); return @($result) }
+        while($remaining.Length -gt $Limit) {
+            $cut=$remaining.LastIndexOf(' ',[Math]::Min($remaining.Length-1,$Limit))
+            if($cut -lt [Math]::Max(10,[int]($Limit*0.45))){$cut=$Limit}
+            $result.Add($remaining.Substring(0,$cut).Trim())
             $remaining=$remaining.Substring($cut).TrimStart()
         }
-        if($remaining.Length -gt 0){$expanded.Add([pscustomobject]@{text=$remaining;kind=$kind})}
+        if($remaining.Length -gt 0){$result.Add($remaining)}
+        return @($result)
     }
-    $height=320
-    foreach($line in $expanded){$height += $(if($line.kind -eq 'section'){72}elseif($line.kind -eq 'divider'){20}else{43})}
-    $height=[math]::Min(12000,[math]::Max(1150,$height+95))
-    $bmp=New-Object System.Drawing.Bitmap($width,$height)
-    $g=[System.Drawing.Graphics]::FromImage($bmp)
-    $fontHead=$null;$fontSmall=$null;$fontTitle=$null;$fontScore=$null;$bgBrush=$null;$whiteBrush=$null;$mutedBrush=$null;$accentBrush=$null;$linePen=$null
+
+    $expanded=New-Object 'System.Collections.Generic.List[object]'
+    foreach($entry in @($Lines)) {
+        $kind=[string]$entry.kind
+        $limit=if($kind -eq 'section'){50}else{64}
+        foreach($piece in @(_WrapOverlayText ([string]$entry.text) $limit)) {
+            $expanded.Add([pscustomobject]@{kind=$kind;text=$piece})
+        }
+    }
+
+    $screenDrawn=$true
+    $bmp=$null; $g=$null
+    try {
+        $vs=[System.Windows.Forms.SystemInformation]::VirtualScreen
+        if($vs.Width -le 0 -or $vs.Height -le 0) { throw 'Virtual screen size unavailable' }
+        $bmp=New-Object System.Drawing.Bitmap($vs.Width,$vs.Height)
+        $g=[System.Drawing.Graphics]::FromImage($bmp)
+        $g.CopyFromScreen($vs.Left,$vs.Top,0,0,$bmp.Size)
+    } catch {
+        $screenDrawn=$false
+        if($g){$g.Dispose();$g=$null}
+        if($bmp){$bmp.Dispose();$bmp=$null}
+        $bmp=New-Object System.Drawing.Bitmap(1600,900)
+        $g=[System.Drawing.Graphics]::FromImage($bmp)
+        $g.Clear([System.Drawing.Color]::FromArgb(18,24,36))
+    }
+
+    $titleFont=$null;$headFont=$null;$bodyFont=$null;$smallFont=$null
+    $whiteBrush=$null;$mutedBrush=$null;$accentBrush=$null;$warnBrush=$null;$shadowBrush=$null
+    $panelBrush=$null;$titleBarBrush=$null;$badgeBrush=$null;$linePen=$null;$edgePen=$null
     try {
         $g.SmoothingMode=[System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-        $g.TextRenderingHint=[System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
-        $bgBrush=[System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(12,19,34))
-        $whiteBrush=[System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(239,245,255))
-        $mutedBrush=[System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(182,199,221))
-        $accentBrush=[System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(97,221,209))
-        $linePen=[System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(43,62,84),2)
-        $fontHead=[System.Drawing.Font]::new('Segoe UI',30,[System.Drawing.FontStyle]::Bold)
-        $fontTitle=[System.Drawing.Font]::new('Segoe UI',23,[System.Drawing.FontStyle]::Bold)
-        $fontSmall=[System.Drawing.Font]::new('Segoe UI',20,[System.Drawing.FontStyle]::Regular)
-        $fontScore=[System.Drawing.Font]::new('Segoe UI',78,[System.Drawing.FontStyle]::Bold)
-        $g.FillRectangle($bgBrush,0,0,$width,$height)
-        $g.DrawString('NETWORK SECURITY AUDITOR  /  REPORT', $fontHead,$whiteBrush,76,65)
-        $g.DrawString(('{0}/100' -f $Score),$fontScore,$accentBrush,76,120)
-        $g.DrawString(('STATUS  '+$Grade),$fontTitle,$mutedBrush,475,177)
-        $g.DrawLine($linePen,76,293,$width-76,293)
-        $y=327
-        foreach($line in $expanded){
-            if($y -gt $height - 90){break}
-            switch ($line.kind){
-              'section' {
-                $g.DrawString($line.text,$fontTitle,$accentBrush,76,$y)
-                $y+=72;break
-              }
-              'divider' { $g.DrawLine($linePen,76,$y+8,$width-76,$y+8);$y+=20;break }
-              default { $g.DrawString($line.text,$fontSmall,$whiteBrush,87,$y);$y+=43;break }
-            }
+        $g.TextRenderingHint=[System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+
+        $titleFont=[System.Drawing.Font]::new('Segoe UI',22,[System.Drawing.FontStyle]::Bold)
+        $headFont=[System.Drawing.Font]::new('Consolas',14,[System.Drawing.FontStyle]::Bold)
+        $bodyFont=[System.Drawing.Font]::new('Consolas',12,[System.Drawing.FontStyle]::Regular)
+        $smallFont=[System.Drawing.Font]::new('Segoe UI',10,[System.Drawing.FontStyle]::Regular)
+
+        $whiteBrush=[System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(245,247,250))
+        $mutedBrush=[System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(196,205,219))
+        $accentBrush=[System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(85,235,195))
+        $warnBrush=[System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255,201,92))
+        $shadowBrush=[System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(55,0,0,0))
+        $panelBrush=[System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(188,11,18,28))
+        $titleBarBrush=[System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(215,20,30,45))
+        $badgeBrush=[System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(230,21,122,93))
+        $linePen=[System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(95,92,118,148),1)
+        $edgePen=[System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(170,62,83,110),2)
+
+        $panelWidth=[Math]::Min(860,[Math]::Max(680,$bmp.Width-90))
+        $x=35; $y=35
+        $panelHeight=132
+        foreach($line in $expanded) {
+            $h=if($line.kind -eq 'section'){28}elseif($line.kind -eq 'divider'){12}else{21}
+            $panelHeight += $h
         }
-        $g.DrawString('Rule-based indicators / Эвристика, не пентест', $fontSmall,$mutedBrush,76,$height-67)
+        $panelHeight += 42
+        if($panelHeight -gt ($bmp.Height-70)) { $panelHeight = $bmp.Height-70 }
+
+        $panelRect=New-Object System.Drawing.Rectangle($x,$y,$panelWidth,$panelHeight)
+        $titleRect=New-Object System.Drawing.Rectangle($x,$y,$panelWidth,62)
+        $badgeRect=New-Object System.Drawing.Rectangle(($x+$panelWidth-155),($y+12),122,38)
+
+        $g.FillRectangle($shadowBrush,($x+6),($y+7),$panelWidth,$panelHeight)
+        $g.FillRectangle($panelBrush,$panelRect)
+        $g.DrawRectangle($edgePen,$panelRect)
+        $g.FillRectangle($titleBarBrush,$titleRect)
+        $g.DrawString('NETWORK SECURITY AUDITOR', $titleFont, $whiteBrush, ($x+18), ($y+13))
+        $g.DrawString('live screen overlay / поверх скриншота', $smallFont, $mutedBrush, ($x+22), ($y+43))
+
+        $g.FillRectangle($badgeBrush,$badgeRect)
+        $g.DrawString(("{0}/100" -f $Score), $headFont, $whiteBrush, ($badgeRect.X+12), ($badgeRect.Y+10))
+        $g.DrawString($Grade, $smallFont, $whiteBrush, ($badgeRect.X+74), ($badgeRect.Y+11))
+
+        if(-not $screenDrawn) {
+            $g.DrawString('Screen capture unavailable -> fallback background used', $smallFont, $warnBrush, ($x+18), ($y+$panelHeight-28))
+        }
+
+        $cursorY=$y+78
+        foreach($line in $expanded) {
+            switch($line.kind) {
+                'section' {
+                    $g.DrawLine($linePen,($x+18),($cursorY+3),($x+$panelWidth-18),($cursorY+3))
+                    $g.DrawString([string]$line.text, $headFont, $accentBrush, ($x+18), ($cursorY+6))
+                    $cursorY += 28
+                }
+                'divider' {
+                    $g.DrawLine($linePen,($x+18),($cursorY+6),($x+$panelWidth-18),($cursorY+6))
+                    $cursorY += 12
+                }
+                default {
+                    $brush=if(([string]$line.text) -match 'CRITICAL|ВЫСОК|HIGH|RISK|ATTENTION|WARNING'){ $warnBrush } else { $whiteBrush }
+                    $g.DrawString([string]$line.text, $bodyFont, $brush, ($x+24), $cursorY)
+                    $cursorY += 21
+                }
+            }
+            if($cursorY -gt ($y+$panelHeight-40)) { break }
+        }
+
+        $stampText='Generated: '+(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        $g.DrawString($stampText,$smallFont,$mutedBrush,($x+18),($y+$panelHeight-26))
+        $g.DrawString('Sensitive desktop content may be visible in the screenshot.', $smallFont, $mutedBrush, ($x+280), ($y+$panelHeight-26))
+
         $bmp.Save($FilePath,[System.Drawing.Imaging.ImageFormat]::Png)
-    }finally{
-        if($fontHead){$fontHead.Dispose()};if($fontSmall){$fontSmall.Dispose()};if($fontTitle){$fontTitle.Dispose()};if($fontScore){$fontScore.Dispose()}
-        if($bgBrush){$bgBrush.Dispose()};if($whiteBrush){$whiteBrush.Dispose()};if($mutedBrush){$mutedBrush.Dispose()};if($accentBrush){$accentBrush.Dispose()};if($linePen){$linePen.Dispose()}
-        $g.Dispose();$bmp.Dispose()
+    }
+    finally {
+        foreach($obj in @($g,$bmp,$titleFont,$headFont,$bodyFont,$smallFont,$whiteBrush,$mutedBrush,$accentBrush,$warnBrush,$shadowBrush,$panelBrush,$titleBarBrush,$badgeBrush,$linePen,$edgePen)) {
+            if($obj -and ($obj -is [System.IDisposable])) { try { $obj.Dispose() } catch {} }
+        }
     }
 }
 function Send-TgPhoto([string]$Path) {
@@ -619,7 +688,7 @@ function Send-TgPhoto([string]$Path) {
                 if(-not $script:sentTo.Contains([string]$chatId)){$script:sentTo.Add([string]$chatId)}
             } catch {
                 $clean=$_.Exception.Message.Replace($TelegramBotToken,'[BOT_TOKEN_REDACTED]')
-                $script:telegramFailures.Add("Chat $chatId PNG: $clean")
+                $script:telegramFailures.Add("Chat $chatId image: $clean")
             } finally { if($null -ne $form){$form.Dispose()} }
         }
     }finally{$http.Dispose()}
@@ -983,7 +1052,7 @@ if($SendReportImage) {
       [pscustomobject]@{kind='row';text=$assessment.local_summary_ru},
       [pscustomobject]@{kind='row';text=$assessment.local_summary_en}
     )
-    try { New-AuditPng $pngPath $pngRows $score $tier }catch{$script:errorsList.Add('PNG report: '+$_.Exception.Message);Write-Warning ('PNG creation failed: '+$_.Exception.Message)}
+    try { New-AuditPng $pngPath $pngRows $score $tier }catch{$script:errorsList.Add('PNG report: '+$_.Exception.Message);Write-Warning ('Screen overlay image creation failed: '+$_.Exception.Message)}
 }
 if($SendTelegram) {
     if([string]::IsNullOrWhiteSpace($TelegramBotToken) -or $TelegramBotToken -eq 'PASTE_NEW_BOT_TOKEN_HERE') {
@@ -1016,7 +1085,7 @@ $summaryPath=Join-Path $OutputDir ("network_audit_${stamp}.txt")
 (@($overview,$securityText,('FINDINGS / НАХОДКИ' + "`n" + ((@($findings | ForEach-Object {$_.ru+' / '+$_.en}) -join "`n"))),('ASSESSMENT METHOD' + "`n" + 'Local deterministic rules only; no AI API used')) -join "`n`n") | Set-Content -Path $summaryPath -Encoding UTF8
 Write-Host "JSON: $jsonPath" -ForegroundColor Green
 Write-Host "TXT:  $summaryPath" -ForegroundColor Green
-if(Test-Path $pngPath){Write-Host "PNG:  $pngPath" -ForegroundColor Green}
+if(Test-Path $pngPath){Write-Host "IMAGE:  $pngPath" -ForegroundColor Green}
 if($telegramFailures.Count -gt 0){
     ('TELEGRAM SEND ERRORS' + "`n" + ($telegramFailures.ToArray() -join "`n")) | Add-Content -Path $summaryPath -Encoding UTF8
 }
