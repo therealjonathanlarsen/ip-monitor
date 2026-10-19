@@ -34,33 +34,7 @@ try { Add-Type -AssemblyName System.Drawing -ErrorAction Stop } catch {}
 try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop } catch {}
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
-# One explicit approval at script start. Consent is per-run and never persisted.
-# No image is captured or transmitted if the user cancels here.
-if(-not $TestTelegramOnly -and ($SendReportImage -or $TestScreenshotOnly)) {
-    Write-Host ''
-    Write-Host '================== SCREENSHOT CONSENT ==================' -ForegroundColor Yellow
-    if($TestScreenshotOnly) {
-        Write-Host 'Do you agree to capture and save a screenshot of your visible desktop locally?' -ForegroundColor White
-        Write-Host 'Согласны сделать и сохранить локальный снимок экрана? В Telegram он НЕ отправляется.' -ForegroundColor White
-    } elseif($SendTelegram) {
-        Write-Host 'Do you agree to capture your visible desktop with an audit overlay and SHARE IT in Telegram?' -ForegroundColor White
-        Write-Host 'Согласны сделать скриншот рабочего стола с отчетом и ОТПРАВИТЬ его в Telegram?' -ForegroundColor White
-        Write-Host ('Telegram chat ID(s): '+$TelegramChatIds) -ForegroundColor Yellow
-    } else {
-        Write-Host 'Do you agree to capture your visible desktop and save the audit image locally?' -ForegroundColor White
-        Write-Host 'Согласны сделать скриншот рабочего стола и сохранить его только на этом ПК?' -ForegroundColor White
-    }
-    Write-Host 'The screenshot may contain open windows, messages, or confidential information.' -ForegroundColor DarkYellow
-    Write-Host 'На скриншоте могут быть видны открытые окна, переписки и личные данные.' -ForegroundColor DarkYellow
-    $screenshotApproval=Read-Host 'Press ENTER to agree and start / ENTER - согласие и запуск; Ctrl+C - выход'
-    if($null -eq $screenshotApproval -or $screenshotApproval.Length -ne 0) {
-        Write-Host 'Cancelled: no audit started, no screenshot captured / Отменено.' -ForegroundColor Yellow
-        return
-    }
-    Write-Host 'Screenshot consent accepted for this run / Согласие получено для этого запуска.' -ForegroundColor Green
-    Write-Host '========================================================' -ForegroundColor DarkGray
-    Write-Host ''
-}
+
 New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $errorsList = New-Object 'System.Collections.Generic.List[string]'
